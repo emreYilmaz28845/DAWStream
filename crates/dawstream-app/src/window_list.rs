@@ -1,14 +1,14 @@
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetWindowLongW, GetWindowRect, GetWindowTextLengthW,
-    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, GWL_EXSTYLE,
-    WS_EX_TOOLWINDOW,
+    EnumWindows, GetClassNameW, GetWindowLongW, GetWindowRect, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, GWL_EXSTYLE, WS_EX_TOOLWINDOW,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WindowInfo {
     pub hwnd: isize,
+    pub pid: u32,
     pub title: String,
     pub is_daw: bool,
 }
@@ -112,11 +112,6 @@ unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
         return BOOL(1);
     }
 
-    let len = GetWindowTextLengthW(hwnd);
-    if len <= 0 {
-        return BOOL(1);
-    }
-
     let mut rect = RECT::default();
     if GetWindowRect(hwnd, &mut rect).is_err() {
         return BOOL(1);
@@ -125,7 +120,8 @@ unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
         return BOOL(1);
     }
 
-    let mut buf = vec![0u16; (len + 1) as usize];
+    // Fixed stack buffer avoids unbounded heap allocation / integer overflow from GetWindowTextLengthW
+    let mut buf = [0u16; 1025];
     let copied = GetWindowTextW(hwnd, &mut buf);
     if copied <= 0 {
         return BOOL(1);
@@ -147,6 +143,7 @@ unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let is_daw = is_daw_window(&class_name, &title);
     state.windows.push(WindowInfo {
         hwnd: hwnd.0 as isize,
+        pid,
         title,
         is_daw,
     });

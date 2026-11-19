@@ -3,10 +3,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use dawstream_ipc::SharedAudioRing;
+use dawstream_ipc::{SharedAudioRing, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
-use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{CloseHandle, S_FALSE, S_OK, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
     eRender, IAudioClient, IAudioRenderClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
     AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
@@ -95,13 +95,31 @@ unsafe fn pwstr_to_string_and_free(pwstr: PWSTR) -> String {
     s
 }
 
+/// Balanced RAII guard for COM initialization: only calls `CoUninitialize`
+/// if `CoInitializeEx` succeeded with `S_OK` or `S_FALSE`.
+struct ComGuard(bool);
+
+impl ComGuard {
+    fn init_mta() -> Self {
+        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        Self(hr == S_OK || hr == S_FALSE)
+    }
+}
+
+impl Drop for ComGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            unsafe { CoUninitialize() };
+        }
+    }
+}
+
 /// Lists all active Windows WASAPI output (render) endpoints.
 pub fn list_output_devices() -> Vec<AudioOutputDevice> {
     let mut devices = Vec::new();
+    let _com = ComGuard::init_mta();
 
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-
         let Ok(enumerator): windows::core::Result<IMMDeviceEnumerator> =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
         else {
@@ -255,9 +273,7 @@ fn audio_thread_main(
     device_changed: Arc<AtomicBool>,
     status: Arc<Mutex<AudioStatus>>,
 ) {
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-    }
+    let _com = ComGuard::init_mta();
 
     let ring = match SharedAudioRing::open_or_create() {
         Ok(r) => r,
@@ -265,7 +281,6 @@ fn audio_thread_main(
             if let Ok(mut s) = status.lock() {
                 s.last_error = Some(format!("Shared memory error: {e}"));
             }
-            unsafe { CoUninitialize() };
             return;
         }
     };
@@ -283,7 +298,7 @@ fn audio_thread_main(
             continue;
         };
 
-        let sample_rate = ring.sample_rate().clamp(22_050, 192_000);
+        let sample_rate = ring.sample_rate().clamp(MIN_SAMPLE_RATE, MAX_SAMPLE_RATE);
         if let Err(e) = run_wasapi_session(
             &ring,
             &dev_id,
@@ -305,10 +320,6 @@ fn audio_thread_main(
                 thread::sleep(Duration::from_millis(100));
             }
         }
-    }
-
-    unsafe {
-        CoUninitialize();
     }
 }
 
@@ -410,7 +421,9 @@ fn run_wasapi_session(
 
         // Pre-fill silence before starting
         if let Ok(buf_ptr) = render_client.GetBuffer(buffer_frames) {
-            std::ptr::write_bytes(buf_ptr, 0, (buffer_frames as usize) * (block_align as usize));
+            if !buf_ptr.is_null() {
+                std::ptr::write_bytes(buf_ptr, 0, (buffer_frames as usize) * (block_align as usize));
+            }
             let _ = render_client.ReleaseBuffer(buffer_frames, 0);
         }
 
@@ -434,8 +447,9 @@ fn run_wasapi_session(
         while running.load(Ordering::Acquire) && !device_changed.load(Ordering::Acquire) {
             ring.bump_app_heartbeat();
 
-            // Restart WASAPI if the DAW changed sample rate
-            if ring.sample_rate() != sample_rate && ring.sample_rate() >= 22_050 {
+            // Restart WASAPI only if the clamped sample rate actually changed
+            let ring_sr = ring.sample_rate().clamp(MIN_SAMPLE_RATE, MAX_SAMPLE_RATE);
+            if ring_sr != sample_rate {
                 break;
             }
 
@@ -496,14 +510,18 @@ fn run_wasapi_session(
             }
 
             match render_client.GetBuffer(frames_available) {
-                Ok(ptr) => {
-                    let dst = std::slice::from_raw_parts_mut(ptr as *mut f32, sample_count);
-                    dst.copy_from_slice(slice);
+                Ok(ptr) if !ptr.is_null() => {
+                    // Byte-wise copy avoids alignment UB on *mut u8 -> *mut f32 casts
+                    std::ptr::copy_nonoverlapping(
+                        slice.as_ptr() as *const u8,
+                        ptr,
+                        sample_count * std::mem::size_of::<f32>(),
+                    );
                     if render_client.ReleaseBuffer(frames_available, 0).is_err() {
                         break;
                     }
                 }
-                Err(_) => break,
+                _ => break,
             }
 
             // Update UI status every ~33ms

@@ -47,7 +47,14 @@ impl AppConfig {
             let _ = fs::create_dir_all(parent);
         }
         if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = fs::write(path, json);
+            // Atomic write: write to temp file in same directory, then rename over target
+            let tmp_path = path.with_extension("json.tmp");
+            if fs::write(&tmp_path, json).is_ok() {
+                if fs::rename(&tmp_path, &path).is_err() {
+                    let _ = fs::remove_file(&path);
+                    let _ = fs::rename(&tmp_path, &path);
+                }
+            }
         }
     }
 }

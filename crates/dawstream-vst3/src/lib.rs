@@ -1,6 +1,7 @@
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,14 +12,15 @@ use nih_plug_egui::{create_egui_editor, egui, EguiState};
 pub struct DawStreamPlugin {
     params: Arc<DawStreamParams>,
     ring: Option<Arc<SharedAudioRing>>,
-    instance_id: u64,
+    instance_id: Arc<AtomicU64>,
 }
 
 impl Drop for DawStreamPlugin {
     fn drop(&mut self) {
         if let Some(ring) = &self.ring {
-            if self.instance_id != 0 {
-                ring.release_owner(self.instance_id);
+            let id = self.instance_id.load(Ordering::Acquire);
+            if id != 0 {
+                ring.release_owner(id);
             }
         }
     }
@@ -65,68 +67,87 @@ impl Default for DawStreamParams {
 impl Default for DawStreamPlugin {
     fn default() -> Self {
         let ring = SharedAudioRing::open_or_create().ok().map(Arc::new);
-        let instance_id = ring.as_ref().map(|r| r.alloc_instance_id()).unwrap_or(0);
+        let id = ring.as_ref().map(|r| r.alloc_instance_id()).unwrap_or(0);
         Self {
             params: Arc::new(DawStreamParams::default()),
             ring,
-            instance_id,
+            instance_id: Arc::new(AtomicU64::new(id)),
         }
     }
 }
 
 struct EditorUiState {
     ring: Option<Arc<SharedAudioRing>>,
-    instance_id: u64,
+    instance_id: Arc<AtomicU64>,
     last_app_hb: u64,
-    last_app_hb_time: Instant,
+    last_app_hb_time: Option<Instant>,
     app_connected: bool,
     smooth_l: f32,
     smooth_r: f32,
     launch_error: Option<(String, Instant)>,
 }
 
-fn is_allowed_companion_exe(p: &std::path::Path) -> bool {
-    if !p.is_file() {
-        return false;
+/// Validates that a candidate path is a local, absolute, non-UNC executable
+/// named `DAWStream.exe` (or `dawstream-app.exe`), preventing SMB NTLMv2 leaks
+/// and arbitrary binary execution.
+fn validate_companion_exe(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    // Reject UNC, device, or network paths BEFORE touching the filesystem (prevents SMB auth leak)
+    if trimmed.starts_with(r"\\") || trimmed.starts_with("//") {
+        return None;
     }
-    match p.file_name().and_then(|n| n.to_str()) {
-        Some(name) => {
-            let lower = name.to_ascii_lowercase();
-            lower == "dawstream.exe" || lower == "dawstream-app.exe"
-        }
-        None => false,
+
+    let p = Path::new(trimmed);
+    if !p.is_absolute() {
+        return None;
     }
+
+    let name = p.file_name()?.to_str()?.to_ascii_lowercase();
+    if name != "dawstream.exe" && name != "dawstream-app.exe" {
+        return None;
+    }
+
+    let canonical = std::fs::canonicalize(p).ok()?;
+    let canon_str = canonical.to_string_lossy();
+    // Canonicalized UNC paths on Windows start with \\?\UNC\
+    if canon_str.to_ascii_uppercase().starts_with(r"\\?\UNC\") {
+        return None;
+    }
+
+    if !canonical.is_file() {
+        return None;
+    }
+
+    Some(canonical)
 }
 
 fn find_dawstream_exe() -> Option<PathBuf> {
-    // 1. Registered path saved by DAWStream.exe on startup (strictly validated)
+    // 1. Standard install locations first (most trusted)
+    if let Some(local_app) = std::env::var_os("LOCALAPPDATA") {
+        let p = PathBuf::from(local_app)
+            .join("DAWStream")
+            .join("DAWStream.exe");
+        if let Some(valid) = p.to_str().and_then(validate_companion_exe) {
+            return Some(valid);
+        }
+    }
+
+    if let Some(valid) = validate_companion_exe(r"C:\Program Files\DAWStream\DAWStream.exe") {
+        return Some(valid);
+    }
+
+    // 2. Registered path saved by DAWStream.exe on startup (strictly validated)
     if let Some(appdata) = std::env::var_os("APPDATA") {
         let cfg_path = PathBuf::from(appdata).join("DAWStream").join("config.json");
         if let Ok(text) = std::fs::read_to_string(cfg_path) {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
                 if let Some(exe_str) = val.get("app_exe_path").and_then(|v| v.as_str()) {
-                    let p = PathBuf::from(exe_str);
-                    if is_allowed_companion_exe(&p) {
-                        return Some(p);
+                    if let Some(valid) = validate_companion_exe(exe_str) {
+                        return Some(valid);
                     }
                 }
             }
         }
-    }
-
-    // 2. Standard install locations
-    if let Some(local_app) = std::env::var_os("LOCALAPPDATA") {
-        let p = PathBuf::from(local_app)
-            .join("DAWStream")
-            .join("DAWStream.exe");
-        if is_allowed_companion_exe(&p) {
-            return Some(p);
-        }
-    }
-
-    let pf = PathBuf::from(r"C:\Program Files\DAWStream\DAWStream.exe");
-    if is_allowed_companion_exe(&pf) {
-        return Some(pf);
     }
 
     None
@@ -185,12 +206,19 @@ impl Plugin for DawStreamPlugin {
             .clone()
             .or_else(|| SharedAudioRing::open_or_create().ok().map(Arc::new));
 
+        if let Some(ref r) = ring {
+            if self.instance_id.load(Ordering::Acquire) == 0 {
+                self.instance_id
+                    .store(r.alloc_instance_id(), Ordering::Release);
+            }
+        }
+
         let initial_hb = ring.as_ref().map(|r| r.app_heartbeat()).unwrap_or(0);
         let ui_state = EditorUiState {
             ring,
-            instance_id: self.instance_id,
+            instance_id: self.instance_id.clone(),
             last_app_hb: initial_hb,
-            last_app_hb_time: Instant::now() - Duration::from_secs(2),
+            last_app_hb_time: None,
             app_connected: false,
             smooth_l: 0.0,
             smooth_r: 0.0,
@@ -207,17 +235,22 @@ impl Plugin for DawStreamPlugin {
                 ctx.set_visuals(visuals);
             },
             move |egui_ctx, setter, state| {
+                let my_id = state.instance_id.load(Ordering::Acquire);
                 let (peak_l, peak_r, sr, is_owner) = if let Some(ring) = &state.ring {
                     let hb = ring.app_heartbeat();
                     if hb != state.last_app_hb {
                         state.last_app_hb = hb;
-                        state.last_app_hb_time = Instant::now();
+                        state.last_app_hb_time = Some(Instant::now());
                         state.app_connected = true;
-                    } else if state.last_app_hb_time.elapsed() > Duration::from_millis(800) {
+                    } else if state
+                        .last_app_hb_time
+                        .map(|t| t.elapsed() > Duration::from_millis(800))
+                        .unwrap_or(true)
+                    {
                         state.app_connected = false;
                     }
                     let owner = ring.active_owner_id();
-                    let is_owner = owner == 0 || owner == state.instance_id;
+                    let is_owner = owner == 0 || (my_id != 0 && owner == my_id);
                     let (l, r) = if is_owner { ring.peaks() } else { (0.0, 0.0) };
                     (l, r, ring.sample_rate(), is_owner)
                 } else {
@@ -270,7 +303,12 @@ impl Plugin for DawStreamPlugin {
                                 if !is_owner {
                                     if ui.button("Take Over").clicked() {
                                         if let Some(ring) = &state.ring {
-                                            ring.force_claim_owner(state.instance_id);
+                                            let mut id = state.instance_id.load(Ordering::Acquire);
+                                            if id == 0 {
+                                                id = ring.alloc_instance_id();
+                                                state.instance_id.store(id, Ordering::Release);
+                                            }
+                                            ring.force_claim_owner(id);
                                         }
                                     }
                                 } else {
@@ -379,10 +417,12 @@ impl Plugin for DawStreamPlugin {
             self.ring = SharedAudioRing::open_or_create().ok().map(Arc::new);
         }
         if let Some(ring) = &self.ring {
-            if self.instance_id == 0 {
-                self.instance_id = ring.alloc_instance_id();
+            let mut id = self.instance_id.load(Ordering::Acquire);
+            if id == 0 {
+                id = ring.alloc_instance_id();
+                self.instance_id.store(id, Ordering::Release);
             }
-            if ring.is_or_claim_owner(self.instance_id) {
+            if ring.is_or_claim_owner(id) {
                 ring.set_sample_rate(buffer_config.sample_rate.round() as u32);
             }
         }
@@ -400,7 +440,8 @@ impl Plugin for DawStreamPlugin {
         };
 
         // Only the active owner instance writes to shared memory (prevents multi-instance glitches)
-        if !ring.is_or_claim_owner(self.instance_id) {
+        let id = self.instance_id.load(Ordering::Acquire);
+        if !ring.is_or_claim_owner(id) {
             return ProcessStatus::Normal;
         }
 

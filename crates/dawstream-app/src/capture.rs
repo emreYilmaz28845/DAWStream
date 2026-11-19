@@ -1,5 +1,5 @@
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -10,12 +10,15 @@ use windows::Win32::Graphics::Gdi::{
     BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
 };
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
-use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect, IsIconic, IsWindow};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetClientRect, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindow,
+};
 
 /// `PW_RENDERFULLCONTENT` (0x00000002) captures Direct2D / DWM / hardware-accelerated windows.
 const PW_RENDERFULLCONTENT: u32 = 0x0000_0002;
 const PW_CLIENTONLY: u32 = 0x0000_0001;
-const MAX_CAPTURE_DIM: i32 = 8192;
+/// Cap capture dimensions at 4K (4096x4096) to prevent OOM or GPU texture limit aborts.
+const MAX_CAPTURE_DIM: i32 = 4096;
 
 pub struct CapturedFrame {
     pub width: usize,
@@ -26,6 +29,7 @@ pub struct CapturedFrame {
 
 pub struct WindowCapturer {
     target_hwnd: Arc<AtomicIsize>,
+    target_pid: Arc<AtomicU32>,
     running: Arc<AtomicBool>,
     latest_frame: Arc<Mutex<Option<CapturedFrame>>>,
     fps_x10: Arc<AtomicU64>,
@@ -35,11 +39,13 @@ pub struct WindowCapturer {
 impl WindowCapturer {
     pub fn start(target_fps: u32) -> Self {
         let target_hwnd = Arc::new(AtomicIsize::new(0));
+        let target_pid = Arc::new(AtomicU32::new(0));
         let running = Arc::new(AtomicBool::new(true));
         let latest_frame = Arc::new(Mutex::new(None));
         let fps_x10 = Arc::new(AtomicU64::new(0));
 
         let t_hwnd = target_hwnd.clone();
+        let t_pid = target_pid.clone();
         let t_run = running.clone();
         let t_frame = latest_frame.clone();
         let t_fps = fps_x10.clone();
@@ -49,12 +55,13 @@ impl WindowCapturer {
         let thread = thread::Builder::new()
             .name("dawstream-capture".into())
             .spawn(move || {
-                capture_loop(t_hwnd, t_run, t_frame, t_fps, frame_interval);
+                capture_loop(t_hwnd, t_pid, t_run, t_frame, t_fps, frame_interval);
             })
             .expect("failed to spawn capture thread");
 
         Self {
             target_hwnd,
+            target_pid,
             running,
             latest_frame,
             fps_x10,
@@ -62,11 +69,20 @@ impl WindowCapturer {
         }
     }
 
-    pub fn set_target(&self, hwnd: Option<isize>) {
-        self.target_hwnd.store(hwnd.unwrap_or(0), Ordering::Release);
-        if hwnd.is_none() {
-            if let Ok(mut guard) = self.latest_frame.lock() {
-                *guard = None;
+    /// Sets the target `(hwnd, pid)`. Storing the PID prevents capturing an unrelated
+    /// window if Windows recycles the HWND after the DAW closes.
+    pub fn set_target(&self, target: Option<(isize, u32)>) {
+        match target {
+            Some((hwnd, pid)) => {
+                self.target_pid.store(pid, Ordering::Release);
+                self.target_hwnd.store(hwnd, Ordering::Release);
+            }
+            None => {
+                self.target_hwnd.store(0, Ordering::Release);
+                self.target_pid.store(0, Ordering::Release);
+                if let Ok(mut guard) = self.latest_frame.lock() {
+                    *guard = None;
+                }
             }
         }
     }
@@ -97,6 +113,7 @@ impl Drop for WindowCapturer {
 
 fn capture_loop(
     target_hwnd: Arc<AtomicIsize>,
+    target_pid: Arc<AtomicU32>,
     running: Arc<AtomicBool>,
     latest_frame: Arc<Mutex<Option<CapturedFrame>>>,
     fps_x10: Arc<AtomicU64>,
@@ -106,7 +123,6 @@ fn capture_loop(
     let mut frames_this_sec: u32 = 0;
     let mut fps_timer = Instant::now();
 
-    // Cached GDI resources to avoid re-creating DIB on every frame
     let mut cached_w: i32 = 0;
     let mut cached_h: i32 = 0;
     let mut mem_dc = windows::Win32::Graphics::Gdi::HDC::default();
@@ -117,6 +133,7 @@ fn capture_loop(
     while running.load(Ordering::Acquire) {
         let loop_start = Instant::now();
         let raw_hwnd = target_hwnd.load(Ordering::Acquire);
+        let expected_pid = target_pid.load(Ordering::Acquire);
 
         if raw_hwnd == 0 {
             fps_x10.store(0, Ordering::Relaxed);
@@ -130,6 +147,22 @@ fn capture_loop(
             if !IsWindow(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
                 thread::sleep(Duration::from_millis(50));
                 continue;
+            }
+
+            // Guard against Windows HWND recycling leaking an unrelated private window
+            if expected_pid != 0 {
+                let mut current_pid: u32 = 0;
+                GetWindowThreadProcessId(hwnd, Some(&mut current_pid));
+                if current_pid != expected_pid {
+                    target_hwnd.store(0, Ordering::Release);
+                    target_pid.store(0, Ordering::Release);
+                    fps_x10.store(0, Ordering::Relaxed);
+                    if let Ok(mut guard) = latest_frame.lock() {
+                        *guard = None;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
             }
 
             let mut rect = RECT::default();
@@ -153,7 +186,6 @@ fn capture_loop(
                 continue;
             }
 
-            // Re-allocate DIB only when dimensions change
             if width != cached_w || height != cached_h || mem_dc.0.is_null() {
                 if !old_obj.0.is_null() && !mem_dc.0.is_null() {
                     SelectObject(mem_dc, old_obj);
@@ -165,11 +197,20 @@ fn capture_loop(
                 }
                 if !mem_dc.0.is_null() {
                     let _ = DeleteDC(mem_dc);
+                    mem_dc = Default::default();
                 }
 
                 let screen_dc = GetDC(HWND::default());
+                if screen_dc.0.is_null() {
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
                 mem_dc = CreateCompatibleDC(screen_dc);
                 ReleaseDC(HWND::default(), screen_dc);
+                if mem_dc.0.is_null() {
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
 
                 let bmi = BITMAPINFO {
                     bmiHeader: BITMAPINFOHEADER {
@@ -186,18 +227,25 @@ fn capture_loop(
 
                 let mut ptr: *mut c_void = std::ptr::null_mut();
                 match CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut ptr, None, 0) {
-                    Ok(bmp) if !ptr.is_null() => {
+                    Ok(bmp) if !bmp.0.is_null() && !ptr.is_null() => {
                         bitmap = bmp;
                         bits_ptr = ptr;
                         old_obj = SelectObject(mem_dc, bitmap);
                         cached_w = width;
                         cached_h = height;
                     }
-                    _ => {
-                        if !mem_dc.0.is_null() {
-                            let _ = DeleteDC(mem_dc);
-                            mem_dc = Default::default();
+                    Ok(bmp) => {
+                        if !bmp.0.is_null() {
+                            let _ = DeleteObject(bmp);
                         }
+                        let _ = DeleteDC(mem_dc);
+                        mem_dc = Default::default();
+                        thread::sleep(Duration::from_millis(100));
+                        continue;
+                    }
+                    Err(_) => {
+                        let _ = DeleteDC(mem_dc);
+                        mem_dc = Default::default();
                         thread::sleep(Duration::from_millis(100));
                         continue;
                     }
@@ -214,7 +262,6 @@ fn capture_loop(
                 let src = std::slice::from_raw_parts(bits_ptr as *const u8, byte_len);
 
                 let mut rgba = vec![0u8; byte_len];
-                // Fast BGRA -> RGBA conversion (force opaque alpha = 255)
                 for (dst_px, src_px) in rgba.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
                     dst_px[0] = src_px[2]; // R
                     dst_px[1] = src_px[1]; // G
@@ -249,7 +296,6 @@ fn capture_loop(
         }
     }
 
-    // Cleanup GDI handles
     unsafe {
         if !old_obj.0.is_null() && !mem_dc.0.is_null() {
             SelectObject(mem_dc, old_obj);

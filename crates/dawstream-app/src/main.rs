@@ -14,6 +14,9 @@ use eframe::egui;
 use window_list::{list_windows, WindowInfo};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
+use windows::Win32::System::LibraryLoader::{
+    SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_SYSTEM32,
+};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
@@ -59,6 +62,11 @@ impl Drop for SingleInstanceGuard {
 }
 
 fn main() -> eframe::Result<()> {
+    // Harden DLL search order against CWD / Downloads DLL hijacking
+    unsafe {
+        let _ = SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }
+
     let Some(_instance_guard) = SingleInstanceGuard::acquire() else {
         return Ok(());
     };
@@ -109,7 +117,8 @@ impl DawStreamApp {
         let saved = AppConfig::load();
 
         let windows = list_windows();
-        let selected_hwnd = windows.iter().find(|w| w.is_daw).map(|w| w.hwnd);
+        let selected_target = windows.iter().find(|w| w.is_daw).map(|w| (w.hwnd, w.pid));
+        let selected_hwnd = selected_target.map(|(h, _)| h);
 
         let devices = list_output_devices();
         let selected_device_id = saved
@@ -125,7 +134,7 @@ impl DawStreamApp {
         audio_engine.set_muted(muted);
 
         let capturer = WindowCapturer::start(60);
-        capturer.set_target(selected_hwnd);
+        capturer.set_target(selected_target);
 
         let app = Self {
             windows,
@@ -163,13 +172,16 @@ impl DawStreamApp {
     fn refresh_windows(&mut self) {
         self.windows = list_windows();
         if let Some(hwnd) = self.selected_hwnd {
-            if !self.windows.iter().any(|w| w.hwnd == hwnd) {
-                self.selected_hwnd = self.windows.iter().find(|w| w.is_daw).map(|w| w.hwnd);
-                self.capturer.set_target(self.selected_hwnd);
+            if let Some(w) = self.windows.iter().find(|w| w.hwnd == hwnd) {
+                self.capturer.set_target(Some((w.hwnd, w.pid)));
+            } else {
+                let daw = self.windows.iter().find(|w| w.is_daw).map(|w| (w.hwnd, w.pid));
+                self.selected_hwnd = daw.map(|(h, _)| h);
+                self.capturer.set_target(daw);
             }
         } else if let Some(daw) = self.windows.iter().find(|w| w.is_daw) {
             self.selected_hwnd = Some(daw.hwnd);
-            self.capturer.set_target(self.selected_hwnd);
+            self.capturer.set_target(Some((daw.hwnd, daw.pid)));
         }
     }
 
@@ -329,7 +341,7 @@ impl eframe::App for DawStreamApp {
                                         .clicked()
                                     {
                                         self.selected_hwnd = Some(win.hwnd);
-                                        self.capturer.set_target(Some(win.hwnd));
+                                        self.capturer.set_target(Some((win.hwnd, win.pid)));
                                     }
                                 }
                             });
@@ -420,17 +432,17 @@ impl eframe::App for DawStreamApp {
                         }
 
                         let mut pct = (self.volume * 100.0).round();
-                        if ui
-                            .add(
-                                egui::Slider::new(&mut pct, 0.0..=150.0)
-                                    .suffix("%")
-                                    .show_value(true)
-                                    .max_decimals(0),
-                            )
-                            .changed()
-                        {
+                        let slider_resp = ui.add(
+                            egui::Slider::new(&mut pct, 0.0..=150.0)
+                                .suffix("%")
+                                .show_value(true)
+                                .max_decimals(0),
+                        );
+                        if slider_resp.changed() {
                             self.volume = pct / 100.0;
                             self.audio_engine.set_volume(self.volume);
+                        }
+                        if slider_resp.drag_stopped() || (slider_resp.changed() && !slider_resp.dragged()) {
                             self.save_config();
                         }
 

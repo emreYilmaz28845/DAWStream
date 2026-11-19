@@ -12,14 +12,18 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_ALL_ACCESS,
-    MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
+    CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, VirtualQuery, FILE_MAP_ALL_ACCESS,
+    MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
 };
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 
 pub const SHARED_MEM_NAME: &str = "Local\\DAWStream_AudioRing_v2";
 pub const MAGIC: u32 = 0x4441_5753; // "DAWS"
+const MAGIC_INITING: u32 = 0x494E_4954; // "INIT"
 pub const VERSION: u32 = 2;
+
+pub const MIN_SAMPLE_RATE: u32 = 22_050;
+pub const MAX_SAMPLE_RATE: u32 = 192_000;
 
 /// If the active producer hasn't processed audio for this long (e.g. DAW crashed
 /// without running Drop), another instance may automatically reclaim ownership.
@@ -134,13 +138,26 @@ impl SharedAudioRing {
                 return Err(format!("MapViewOfFile failed with OS error: {err}"));
             }
 
+            // Verify mapped region is actually large enough (defends against undersized section squatting)
+            let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let queried = VirtualQuery(
+                view.Value,
+                &mut mbi,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            );
+            if queried == 0 || mbi.RegionSize < size {
+                UnmapViewOfFile(view);
+                CloseHandle(handle);
+                return Err("Mapped shared memory region is smaller than expected".into());
+            }
+
             let block = view.Value as *mut SharedAudioBlock;
             let block_ref = &*block;
 
-            // Initialize header once if freshly created (magic == 0)
+            // Two-phase initialization: CAS 0 -> MAGIC_INITING, populate all fields, then Release MAGIC
             if block_ref
                 .magic
-                .compare_exchange(0, MAGIC, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(0, MAGIC_INITING, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 block_ref.version.store(VERSION, Ordering::Release);
@@ -156,11 +173,17 @@ impl SharedAudioRing {
                 block_ref.active_owner_id.store(0, Ordering::Release);
                 block_ref.next_instance_id.store(1, Ordering::Release);
                 block_ref.owner_last_tick_ms.store(0, Ordering::Release);
+                block_ref.magic.store(MAGIC, Ordering::Release);
             } else {
-                // Verify magic & version compatibility
+                // Spin briefly if another process is mid-initialization
+                let mut spins = 0u32;
+                while block_ref.magic.load(Ordering::Acquire) == MAGIC_INITING && spins < 500 {
+                    std::thread::yield_now();
+                    spins += 1;
+                }
                 let magic = block_ref.magic.load(Ordering::Acquire);
                 let ver = block_ref.version.load(Ordering::Acquire);
-                if magic != MAGIC || (ver != 0 && ver != VERSION) {
+                if magic != MAGIC || ver != VERSION {
                     UnmapViewOfFile(view);
                     CloseHandle(handle);
                     return Err(format!(
@@ -178,19 +201,18 @@ impl SharedAudioRing {
         unsafe { &*self.view }
     }
 
-    /// Producer: updates sample rate metadata.
+    /// Producer: updates sample rate metadata (clamped to supported WASAPI bounds).
     #[inline]
     pub fn set_sample_rate(&self, sample_rate: u32) {
-        if (22_050..=384_000).contains(&sample_rate) {
-            self.block().sample_rate.store(sample_rate, Ordering::Release);
-        }
+        let clamped = sample_rate.clamp(MIN_SAMPLE_RATE, MAX_SAMPLE_RATE);
+        self.block().sample_rate.store(clamped, Ordering::Release);
     }
 
-    /// Consumer: reads current sample rate from plugin.
+    /// Consumer: reads current sample rate from plugin (always within supported bounds).
     #[inline]
     pub fn sample_rate(&self) -> u32 {
         let sr = self.block().sample_rate.load(Ordering::Acquire);
-        if (22_050..=384_000).contains(&sr) {
+        if (MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&sr) {
             sr
         } else {
             48_000
@@ -356,7 +378,9 @@ impl SharedAudioRing {
 
         let now = now_tick_ms();
         let last_tick = b.owner_last_tick_ms.load(Ordering::Acquire);
-        let stale = owner == 0 || (last_tick != 0 && now.saturating_sub(last_tick) > OWNER_LEASE_TIMEOUT_MS);
+        let stale = owner == 0
+            || (last_tick != 0
+                && (last_tick > now || now.saturating_sub(last_tick) > OWNER_LEASE_TIMEOUT_MS));
 
         if stale
             && b.active_owner_id
