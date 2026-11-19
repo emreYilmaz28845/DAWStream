@@ -11,6 +11,17 @@ use nih_plug_egui::{create_egui_editor, egui, EguiState};
 pub struct DawStreamPlugin {
     params: Arc<DawStreamParams>,
     ring: Option<Arc<SharedAudioRing>>,
+    instance_id: u64,
+}
+
+impl Drop for DawStreamPlugin {
+    fn drop(&mut self) {
+        if let Some(ring) = &self.ring {
+            if self.instance_id != 0 {
+                ring.release_owner(self.instance_id);
+            }
+        }
+    }
 }
 
 #[derive(Params)]
@@ -53,15 +64,19 @@ impl Default for DawStreamParams {
 
 impl Default for DawStreamPlugin {
     fn default() -> Self {
+        let ring = SharedAudioRing::open_or_create().ok().map(Arc::new);
+        let instance_id = ring.as_ref().map(|r| r.alloc_instance_id()).unwrap_or(0);
         Self {
             params: Arc::new(DawStreamParams::default()),
-            ring: SharedAudioRing::open_or_create().ok().map(Arc::new),
+            ring,
+            instance_id,
         }
     }
 }
 
 struct EditorUiState {
     ring: Option<Arc<SharedAudioRing>>,
+    instance_id: u64,
     last_app_hb: u64,
     last_app_hb_time: Instant,
     app_connected: bool,
@@ -172,6 +187,7 @@ impl Plugin for DawStreamPlugin {
         let initial_hb = ring.as_ref().map(|r| r.app_heartbeat()).unwrap_or(0);
         let ui_state = EditorUiState {
             ring,
+            instance_id: self.instance_id,
             last_app_hb: initial_hb,
             last_app_hb_time: Instant::now() - Duration::from_secs(2),
             app_connected: false,
@@ -190,7 +206,7 @@ impl Plugin for DawStreamPlugin {
                 ctx.set_visuals(visuals);
             },
             move |egui_ctx, setter, state| {
-                let (peak_l, peak_r, sr) = if let Some(ring) = &state.ring {
+                let (peak_l, peak_r, sr, is_owner) = if let Some(ring) = &state.ring {
                     let hb = ring.app_heartbeat();
                     if hb != state.last_app_hb {
                         state.last_app_hb = hb;
@@ -199,10 +215,12 @@ impl Plugin for DawStreamPlugin {
                     } else if state.last_app_hb_time.elapsed() > Duration::from_millis(800) {
                         state.app_connected = false;
                     }
-                    let (l, r) = ring.peaks();
-                    (l, r, ring.sample_rate())
+                    let owner = ring.active_owner_id();
+                    let is_owner = owner == 0 || owner == state.instance_id;
+                    let (l, r) = if is_owner { ring.peaks() } else { (0.0, 0.0) };
+                    (l, r, ring.sample_rate(), is_owner)
                 } else {
-                    (0.0, 0.0, 48_000)
+                    (0.0, 0.0, 48_000, true)
                 };
 
                 state.smooth_l = peak_l.max(state.smooth_l * 0.86);
@@ -221,9 +239,14 @@ impl Plugin for DawStreamPlugin {
                             .inner_margin(egui::Margin::symmetric(12, 10)),
                     )
                     .show(egui_ctx, |ui| {
-                        // Row 1: Status dot + sample rate | Open App button
+                        // Row 1: Status dot + sample rate | Open App / Take Over button
                         ui.horizontal(|ui| {
-                            let (dot_color, status_text) = if state.app_connected {
+                            let (dot_color, status_text) = if !is_owner {
+                                (
+                                    egui::Color32::from_rgb(240, 190, 60),
+                                    "Standby (Another instance active)".to_string(),
+                                )
+                            } else if state.app_connected {
                                 (
                                     egui::Color32::from_rgb(65, 215, 130),
                                     format!("LIVE ({sr} Hz)"),
@@ -243,16 +266,24 @@ impl Plugin for DawStreamPlugin {
                             ui.strong(status_text);
 
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let label = if state.app_connected {
-                                    "App Running"
+                                if !is_owner {
+                                    if ui.button("Take Over").clicked() {
+                                        if let Some(ring) = &state.ring {
+                                            ring.force_claim_owner(state.instance_id);
+                                        }
+                                    }
                                 } else {
-                                    "Open App"
-                                };
-                                let resp = ui
-                                    .add_enabled(!state.app_connected, egui::Button::new(label));
-                                if resp.clicked() {
-                                    if let Err(err) = launch_companion_app() {
-                                        state.launch_error = Some((err, Instant::now()));
+                                    let label = if state.app_connected {
+                                        "App Running"
+                                    } else {
+                                        "Open App"
+                                    };
+                                    let resp = ui
+                                        .add_enabled(!state.app_connected, egui::Button::new(label));
+                                    if resp.clicked() {
+                                        if let Err(err) = launch_companion_app() {
+                                            state.launch_error = Some((err, Instant::now()));
+                                        }
                                     }
                                 }
                             });
@@ -347,7 +378,12 @@ impl Plugin for DawStreamPlugin {
             self.ring = SharedAudioRing::open_or_create().ok().map(Arc::new);
         }
         if let Some(ring) = &self.ring {
-            ring.set_sample_rate(buffer_config.sample_rate.round() as u32);
+            if self.instance_id == 0 {
+                self.instance_id = ring.alloc_instance_id();
+            }
+            if ring.is_or_claim_owner(self.instance_id) {
+                ring.set_sample_rate(buffer_config.sample_rate.round() as u32);
+            }
         }
         true
     }
@@ -361,6 +397,11 @@ impl Plugin for DawStreamPlugin {
         let Some(ring) = &self.ring else {
             return ProcessStatus::Normal;
         };
+
+        // Only the active owner instance writes to shared memory (prevents multi-instance glitches)
+        if !ring.is_or_claim_owner(self.instance_id) {
+            return ProcessStatus::Normal;
+        }
 
         let num_samples = buffer.samples();
         if num_samples == 0 {

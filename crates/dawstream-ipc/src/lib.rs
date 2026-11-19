@@ -51,7 +51,12 @@ pub struct SharedAudioBlock {
 
     /// Incremented by the companion app while actively reading audio.
     pub app_heartbeat: AtomicU64,
-    pub _reserved: [u32; 4],
+
+    /// Multi-instance guard: only the instance whose ID matches `active_owner_id`
+    /// writes into the ring buffer, preventing corruption/glitches if multiple
+    /// plugin instances are loaded in a DAW.
+    pub active_owner_id: AtomicU64,
+    pub next_instance_id: AtomicU64,
 
     /// Interleaved stereo f32 samples: `[L0, R0, L1, R1, ...]`.
     pub samples: [f32; RING_FRAMES * CHANNELS],
@@ -122,6 +127,8 @@ impl SharedAudioRing {
                 block_ref.peak_r_bits.store(0, Ordering::Release);
                 block_ref.plugin_muted.store(0, Ordering::Release);
                 block_ref.app_heartbeat.store(0, Ordering::Release);
+                block_ref.active_owner_id.store(0, Ordering::Release);
+                block_ref.next_instance_id.store(1, Ordering::Release);
             }
 
             Ok(Self { handle, view: block })
@@ -280,6 +287,59 @@ impl SharedAudioRing {
     #[inline]
     pub fn app_heartbeat(&self) -> u64 {
         self.block().app_heartbeat.load(Ordering::Acquire)
+    }
+
+    /// Allocates a unique non-zero producer instance ID.
+    #[inline]
+    pub fn alloc_instance_id(&self) -> u64 {
+        let id = self.block().next_instance_id.fetch_add(1, Ordering::AcqRel);
+        if id == 0 {
+            self.block().next_instance_id.fetch_add(1, Ordering::AcqRel)
+        } else {
+            id
+        }
+    }
+
+    /// Returns `true` if `instance_id` is (or successfully claimed) the active producer.
+    /// Real-time safe (single atomic load in steady state).
+    #[inline]
+    pub fn is_or_claim_owner(&self, instance_id: u64) -> bool {
+        let owner = self.block().active_owner_id.load(Ordering::Acquire);
+        if owner == instance_id {
+            return true;
+        }
+        if owner == 0 {
+            return self
+                .block()
+                .active_owner_id
+                .compare_exchange(0, instance_id, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
+        }
+        false
+    }
+
+    /// Forces `instance_id` to become the active producer ("Take Over").
+    #[inline]
+    pub fn force_claim_owner(&self, instance_id: u64) {
+        self.block()
+            .active_owner_id
+            .store(instance_id, Ordering::Release);
+    }
+
+    /// Releases ownership if `instance_id` currently owns the stream.
+    #[inline]
+    pub fn release_owner(&self, instance_id: u64) {
+        let _ = self.block().active_owner_id.compare_exchange(
+            instance_id,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    #[inline]
+    pub fn active_owner_id(&self) -> u64 {
+        self.block().active_owner_id.load(Ordering::Acquire)
     }
 }
 
