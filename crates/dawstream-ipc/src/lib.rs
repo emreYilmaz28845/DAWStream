@@ -10,17 +10,21 @@ use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, VirtualQuery, FILE_MAP_ALL_ACCESS,
     MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
 };
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 
-pub const SHARED_MEM_NAME: &str = "Local\\DAWStream_AudioRing_v2";
+pub const SHARED_MEM_NAME: &str = "Local\\DAWStream_AudioRing_v3";
 pub const MAGIC: u32 = 0x4441_5753; // "DAWS"
 const MAGIC_INITING: u32 = 0x494E_4954; // "INIT"
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 pub const MIN_SAMPLE_RATE: u32 = 22_050;
 pub const MAX_SAMPLE_RATE: u32 = 192_000;
@@ -28,6 +32,10 @@ pub const MAX_SAMPLE_RATE: u32 = 192_000;
 /// If the active producer hasn't processed audio for this long (e.g. DAW crashed
 /// without running Drop), another instance may automatically reclaim ownership.
 pub const OWNER_LEASE_TIMEOUT_MS: u64 = 1_500;
+
+/// Only write audio samples into shared memory when the companion app has
+/// polled within this window (prevents 24/7 audio broadcast when not streaming).
+pub const CONSUMER_ACTIVE_TIMEOUT_MS: u64 = 1_500;
 
 /// Power-of-two number of stereo frames in the ring buffer.
 /// 65,536 frames @ 48 kHz ~= 1.36 seconds of headroom.
@@ -62,6 +70,8 @@ pub struct SharedAudioBlock {
 
     /// Incremented by the companion app while actively reading audio.
     pub app_heartbeat: AtomicU64,
+    /// Monotonic tick (`GetTickCount64`) when the companion app was last active.
+    pub app_last_tick_ms: AtomicU64,
 
     /// Multi-instance guard: only the instance matching `active_owner_id`
     /// writes into the ring buffer.
@@ -115,14 +125,38 @@ impl SharedAudioRing {
         let size_low = (size as u64 & 0xFFFF_FFFF) as u32;
 
         unsafe {
+            // Restrict section access to current user (Owner) + Administrators,
+            // and enforce Medium Integrity Level to block AppContainer / Low-IL processes.
+            let sddl: Vec<u16> = OsStr::new("D:P(A;;GA;;;OW)(A;;GA;;;BA)S:(ML;;NW;;;ME)")
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+            let sd_ok = ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                ptr::null_mut(),
+            ) != 0;
+
+            let sa = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: sd,
+                bInheritHandle: 0,
+            };
+
             let handle = CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
-                ptr::null(),
+                if sd_ok { &sa } else { ptr::null() },
                 PAGE_READWRITE,
                 size_high,
                 size_low,
                 wide_name.as_ptr(),
             );
+
+            if sd_ok && !sd.is_null() {
+                LocalFree(sd);
+            }
 
             if handle.is_null() {
                 return Err(format!(
@@ -170,6 +204,7 @@ impl SharedAudioRing {
                 block_ref.peak_r_bits.store(0, Ordering::Release);
                 block_ref.plugin_muted.store(0, Ordering::Release);
                 block_ref.app_heartbeat.store(0, Ordering::Release);
+                block_ref.app_last_tick_ms.store(0, Ordering::Release);
                 block_ref.active_owner_id.store(0, Ordering::Release);
                 block_ref.next_instance_id.store(1, Ordering::Release);
                 block_ref.owner_last_tick_ms.store(0, Ordering::Release);
@@ -237,16 +272,24 @@ impl SharedAudioRing {
             1.0
         };
 
+        let now = now_tick_ms();
+        let app_tick = b.app_last_tick_ms.load(Ordering::Acquire);
+        let consumer_active =
+            app_tick != 0 && app_tick <= now && now.saturating_sub(app_tick) <= CONSUMER_ACTIVE_TIMEOUT_MS;
+
         let mut wpos = b.write_pos.load(Ordering::Relaxed);
         let mut peak_l = 0.0f32;
         let mut peak_r = 0.0f32;
 
         if muted {
-            for _ in 0..frames {
-                let idx = (wpos as usize & RING_MASK) * 2;
-                b.samples[idx].store(0, Ordering::Relaxed);
-                b.samples[idx + 1].store(0, Ordering::Relaxed);
-                wpos = wpos.wrapping_add(1);
+            if consumer_active {
+                for _ in 0..frames {
+                    let idx = (wpos as usize & RING_MASK) * 2;
+                    b.samples[idx].store(0, Ordering::Relaxed);
+                    b.samples[idx + 1].store(0, Ordering::Relaxed);
+                    wpos = wpos.wrapping_add(1);
+                }
+                b.write_pos.store(wpos, Ordering::Release);
             }
         } else {
             for i in 0..frames {
@@ -255,17 +298,22 @@ impl SharedAudioRing {
                 peak_l = peak_l.max(l.abs());
                 peak_r = peak_r.max(r.abs());
 
-                let idx = (wpos as usize & RING_MASK) * 2;
-                b.samples[idx].store(l.to_bits(), Ordering::Relaxed);
-                b.samples[idx + 1].store(r.to_bits(), Ordering::Relaxed);
-                wpos = wpos.wrapping_add(1);
+                // Privacy gate: only write audio samples into shared memory when DAWStream.exe is active
+                if consumer_active {
+                    let idx = (wpos as usize & RING_MASK) * 2;
+                    b.samples[idx].store(l.to_bits(), Ordering::Relaxed);
+                    b.samples[idx + 1].store(r.to_bits(), Ordering::Relaxed);
+                    wpos = wpos.wrapping_add(1);
+                }
+            }
+            if consumer_active {
+                b.write_pos.store(wpos, Ordering::Release);
             }
         }
 
-        b.write_pos.store(wpos, Ordering::Release);
         b.peak_l_bits.store(peak_l.to_bits(), Ordering::Relaxed);
         b.peak_r_bits.store(peak_r.to_bits(), Ordering::Relaxed);
-        b.owner_last_tick_ms.store(now_tick_ms(), Ordering::Release);
+        b.owner_last_tick_ms.store(now, Ordering::Release);
         b.heartbeat.fetch_add(1, Ordering::Release);
     }
 
@@ -341,7 +389,9 @@ impl SharedAudioRing {
     /// Consumer: signals that the companion app is alive and reading.
     #[inline]
     pub fn bump_app_heartbeat(&self) {
-        self.block().app_heartbeat.fetch_add(1, Ordering::Release);
+        let b = self.block();
+        b.app_last_tick_ms.store(now_tick_ms(), Ordering::Release);
+        b.app_heartbeat.fetch_add(1, Ordering::Release);
     }
 
     /// Producer: reads the companion app heartbeat counter.
@@ -451,6 +501,7 @@ mod tests {
         let name = unique_name("roundtrip");
         let producer = SharedAudioRing::open_or_create_named(&name).unwrap();
         let consumer = SharedAudioRing::open_or_create_named(&name).unwrap();
+        consumer.bump_app_heartbeat();
 
         let left = [0.25f32, -0.5, 0.75, 1.0];
         let right = [-0.25f32, 0.5, -0.75, -1.0];
@@ -463,9 +514,24 @@ mod tests {
     }
 
     #[test]
+    fn privacy_gate_blocks_writes_when_consumer_offline() {
+        let name = unique_name("privacy");
+        let producer = SharedAudioRing::open_or_create_named(&name).unwrap();
+        let consumer = SharedAudioRing::open_or_create_named(&name).unwrap();
+
+        // No app heartbeat yet -> audio samples must NOT be written into shared memory
+        producer.write_planar(&[0.5; 4], &[0.5; 4], 1.0, false);
+        let mut out = [0.0f32; 8];
+        let read = consumer.read_interleaved(&mut out, 64);
+        assert_eq!(read, 0);
+        assert_eq!(out, [0.0; 8]);
+    }
+
+    #[test]
     fn nan_and_inf_are_sanitized() {
         let name = unique_name("sanitize");
         let ring = SharedAudioRing::open_or_create_named(&name).unwrap();
+        ring.bump_app_heartbeat();
 
         let left = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 5.0];
         let right = [-5.0, f32::NAN, 0.5, -0.5];
@@ -514,6 +580,7 @@ mod tests {
     fn ring_buffer_wraparound() {
         let name = unique_name("wrap");
         let ring = SharedAudioRing::open_or_create_named(&name).unwrap();
+        ring.bump_app_heartbeat();
 
         let chunk_l = [0.5f32; 1024];
         let chunk_r = [-0.5f32; 1024];

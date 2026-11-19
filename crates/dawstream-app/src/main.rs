@@ -12,36 +12,76 @@ use capture::WindowCapturer;
 use config::AppConfig;
 use eframe::egui;
 use window_list::{list_windows, WindowInfo};
-use windows::core::PCWSTR;
+use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
 use windows::Win32::System::LibraryLoader::{
     SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_SYSTEM32,
 };
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{
+    CreateMutexW, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    FindWindowW, GetWindowThreadProcessId, SetForegroundWindow, ShowWindow, SW_RESTORE,
 };
 
 const APP_WINDOW_TITLE: &str = "DAWStream — Discord DAW Streaming";
 
 struct SingleInstanceGuard(HANDLE);
 
+unsafe fn hwnd_belongs_to_dawstream(hwnd: windows::Win32::Foundation::HWND) -> bool {
+    let mut pid: u32 = 0;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    if pid == 0 {
+        return false;
+    }
+    let Ok(proc_handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+        return false;
+    };
+    let mut buf = [0u16; 512];
+    let mut len = buf.len() as u32;
+    let ok = QueryFullProcessImageNameW(
+        proc_handle,
+        PROCESS_NAME_WIN32,
+        PWSTR(buf.as_mut_ptr()),
+        &mut len,
+    )
+    .is_ok();
+    let _ = CloseHandle(proc_handle);
+    if !ok || len == 0 {
+        return false;
+    }
+    let full = String::from_utf16_lossy(&buf[..len as usize]);
+    std::path::Path::new(&full)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| {
+            let lower = n.to_ascii_lowercase();
+            lower == "dawstream.exe" || lower == "dawstream-app.exe"
+        })
+        .unwrap_or(false)
+}
+
 impl SingleInstanceGuard {
     /// Returns `None` if another instance of DAWStream.exe is already running
-    /// (and brings the existing window to the foreground).
+    /// (bringing it to the foreground only after verifying its process image name),
+    /// or fails closed if the mutex cannot be created.
     fn acquire() -> Option<Self> {
         let name: Vec<u16> = "Local\\DAWStream_AppSingleInstance_v1\0"
             .encode_utf16()
             .collect();
         unsafe {
             let Ok(handle) = CreateMutexW(None, false, PCWSTR(name.as_ptr())) else {
-                return Some(Self(HANDLE::default()));
+                // Fail closed rather than allowing concurrent readers on the SPSC ring
+                return None;
             };
             if GetLastError() == ERROR_ALREADY_EXISTS {
                 let title: Vec<u16> = format!("{APP_WINDOW_TITLE}\0").encode_utf16().collect();
                 if let Ok(hwnd) = FindWindowW(None, PCWSTR(title.as_ptr())) {
-                    let _ = ShowWindow(hwnd, SW_RESTORE);
-                    let _ = SetForegroundWindow(hwnd);
+                    if hwnd_belongs_to_dawstream(hwnd) {
+                        let _ = ShowWindow(hwnd, SW_RESTORE);
+                        let _ = SetForegroundWindow(hwnd);
+                    }
                 }
                 let _ = CloseHandle(handle);
                 return None;

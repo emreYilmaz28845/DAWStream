@@ -275,13 +275,23 @@ fn audio_thread_main(
 ) {
     let _com = ComGuard::init_mta();
 
-    let ring = match SharedAudioRing::open_or_create() {
-        Ok(r) => r,
-        Err(e) => {
-            if let Ok(mut s) = status.lock() {
-                s.last_error = Some(format!("Shared memory error: {e}"));
-            }
+    let ring = loop {
+        if !running.load(Ordering::Acquire) {
             return;
+        }
+        match SharedAudioRing::open_or_create() {
+            Ok(r) => break r,
+            Err(e) => {
+                if let Ok(mut s) = status.lock() {
+                    s.last_error = Some(format!("Shared memory error (retrying): {e}"));
+                }
+                for _ in 0..10 {
+                    if !running.load(Ordering::Acquire) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
         }
     };
 

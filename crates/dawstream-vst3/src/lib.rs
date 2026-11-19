@@ -8,6 +8,11 @@ use std::time::{Duration, Instant};
 use dawstream_ipc::SharedAudioRing;
 use nih_plug::prelude::*;
 use nih_plug_egui::{create_egui_editor, egui, EguiState};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::Security::{
+    GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+};
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 pub struct DawStreamPlugin {
     params: Arc<DawStreamParams>,
@@ -87,12 +92,37 @@ struct EditorUiState {
     launch_error: Option<(String, Instant)>,
 }
 
+/// Returns `true` if the host DAW process is running with an elevated (Administrator) token.
+/// Fails closed (`true`) if the token cannot be queried.
+fn is_process_elevated() -> bool {
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return true;
+        }
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut ret_len: u32 = 0;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            &mut elevation as *mut TOKEN_ELEVATION as *mut _,
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut ret_len,
+        );
+        CloseHandle(token);
+        if ok == 0 {
+            true
+        } else {
+            elevation.TokenIsElevated != 0
+        }
+    }
+}
+
 /// Validates that a candidate path is a local, absolute, non-UNC executable
 /// named `DAWStream.exe` (or `dawstream-app.exe`), preventing SMB NTLMv2 leaks
 /// and arbitrary binary execution.
 fn validate_companion_exe(raw: &str) -> Option<PathBuf> {
     let trimmed = raw.trim();
-    // Reject UNC, device, or network paths BEFORE touching the filesystem (prevents SMB auth leak)
     if trimmed.starts_with(r"\\") || trimmed.starts_with("//") {
         return None;
     }
@@ -109,7 +139,6 @@ fn validate_companion_exe(raw: &str) -> Option<PathBuf> {
 
     let canonical = std::fs::canonicalize(p).ok()?;
     let canon_str = canonical.to_string_lossy();
-    // Canonicalized UNC paths on Windows start with \\?\UNC\
     if canon_str.to_ascii_uppercase().starts_with(r"\\?\UNC\") {
         return None;
     }
@@ -121,8 +150,24 @@ fn validate_companion_exe(raw: &str) -> Option<PathBuf> {
     Some(canonical)
 }
 
-fn find_dawstream_exe() -> Option<PathBuf> {
-    // 1. Standard install locations first (most trusted)
+fn find_dawstream_exe(elevated: bool) -> Option<PathBuf> {
+    // 1. Always check admin-protected Program Files FIRST (highest trust)
+    let pf_base = std::env::var_os("ProgramFiles")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
+    let pf_exe = pf_base.join("DAWStream").join("DAWStream.exe");
+    if let Some(valid) = pf_exe.to_str().and_then(validate_companion_exe) {
+        return Some(valid);
+    }
+
+    // Security guard (HIGH-1): if the DAW is running elevated (Administrator),
+    // NEVER launch an executable from a user-writable directory (%LOCALAPPDATA% or config.json),
+    // which would allow medium-IL -> high-IL privilege escalation.
+    if elevated {
+        return None;
+    }
+
+    // 2. Per-user standard install location (only when DAW is non-elevated)
     if let Some(local_app) = std::env::var_os("LOCALAPPDATA") {
         let p = PathBuf::from(local_app)
             .join("DAWStream")
@@ -132,11 +177,7 @@ fn find_dawstream_exe() -> Option<PathBuf> {
         }
     }
 
-    if let Some(valid) = validate_companion_exe(r"C:\Program Files\DAWStream\DAWStream.exe") {
-        return Some(valid);
-    }
-
-    // 2. Registered path saved by DAWStream.exe on startup (strictly validated)
+    // 3. Registered path saved by DAWStream.exe (only when DAW is non-elevated)
     if let Some(appdata) = std::env::var_os("APPDATA") {
         let cfg_path = PathBuf::from(appdata).join("DAWStream").join("config.json");
         if let Ok(text) = std::fs::read_to_string(cfg_path) {
@@ -154,14 +195,32 @@ fn find_dawstream_exe() -> Option<PathBuf> {
 }
 
 fn launch_companion_app() -> Result<(), String> {
-    if let Some(exe) = find_dawstream_exe() {
+    let elevated = is_process_elevated();
+    if let Some(exe) = find_dawstream_exe(elevated) {
         Command::new(&exe)
             .spawn()
             .map_err(|e| format!("Launch error: {e}"))?;
         return Ok(());
     }
 
-    Err("DAWStream.exe not found — open it once first".into())
+    if elevated {
+        Err("DAW is elevated: install DAWStream to Program Files (run Install.bat as Admin) or open DAWStream manually".into())
+    } else {
+        Err("DAWStream.exe not found — open it once first".into())
+    }
+}
+
+/// Atomically ensures `slot` holds a non-zero instance ID (race-free CAS).
+fn ensure_instance_id(ring: &SharedAudioRing, slot: &AtomicU64) -> u64 {
+    let existing = slot.load(Ordering::Acquire);
+    if existing != 0 {
+        return existing;
+    }
+    let fresh = ring.alloc_instance_id();
+    match slot.compare_exchange(0, fresh, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => fresh,
+        Err(winner) => winner,
+    }
 }
 
 impl Plugin for DawStreamPlugin {
@@ -207,10 +266,7 @@ impl Plugin for DawStreamPlugin {
             .or_else(|| SharedAudioRing::open_or_create().ok().map(Arc::new));
 
         if let Some(ref r) = ring {
-            if self.instance_id.load(Ordering::Acquire) == 0 {
-                self.instance_id
-                    .store(r.alloc_instance_id(), Ordering::Release);
-            }
+            ensure_instance_id(r, &self.instance_id);
         }
 
         let initial_hb = ring.as_ref().map(|r| r.app_heartbeat()).unwrap_or(0);
@@ -303,11 +359,7 @@ impl Plugin for DawStreamPlugin {
                                 if !is_owner {
                                     if ui.button("Take Over").clicked() {
                                         if let Some(ring) = &state.ring {
-                                            let mut id = state.instance_id.load(Ordering::Acquire);
-                                            if id == 0 {
-                                                id = ring.alloc_instance_id();
-                                                state.instance_id.store(id, Ordering::Release);
-                                            }
+                                            let id = ensure_instance_id(ring, &state.instance_id);
                                             ring.force_claim_owner(id);
                                         }
                                     }
@@ -417,11 +469,7 @@ impl Plugin for DawStreamPlugin {
             self.ring = SharedAudioRing::open_or_create().ok().map(Arc::new);
         }
         if let Some(ring) = &self.ring {
-            let mut id = self.instance_id.load(Ordering::Acquire);
-            if id == 0 {
-                id = ring.alloc_instance_id();
-                self.instance_id.store(id, Ordering::Release);
-            }
+            let id = ensure_instance_id(ring, &self.instance_id);
             if ring.is_or_claim_owner(id) {
                 ring.set_sample_rate(buffer_config.sample_rate.round() as u32);
             }

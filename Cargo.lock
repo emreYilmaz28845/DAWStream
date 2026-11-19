@@ -996,6 +996,7 @@ dependencies = [
  "nih_plug",
  "nih_plug_egui",
  "serde_json",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

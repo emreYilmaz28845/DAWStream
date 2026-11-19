@@ -252,6 +252,21 @@ fn capture_loop(
                 }
             }
 
+            // Re-verify owning PID immediately before PrintWindow to minimize HWND-recycling TOCTOU
+            if expected_pid != 0 {
+                let mut current_pid: u32 = 0;
+                GetWindowThreadProcessId(hwnd, Some(&mut current_pid));
+                if current_pid != expected_pid {
+                    target_hwnd.store(0, Ordering::Release);
+                    target_pid.store(0, Ordering::Release);
+                    fps_x10.store(0, Ordering::Relaxed);
+                    if let Ok(mut guard) = latest_frame.lock() {
+                        *guard = None;
+                    }
+                    continue;
+                }
+            }
+
             if PrintWindow(hwnd, mem_dc, flags).as_bool() {
                 let Some(pixel_count) = (width as usize).checked_mul(height as usize) else {
                     continue;
