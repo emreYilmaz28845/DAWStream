@@ -47,7 +47,7 @@ if exist "%DIST_DIR%\DAWStream.clap" (
 )
 
 echo [4/4] Creating Desktop shortcut...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=(New-Object -COM WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop')+'\DAWStream.lnk');$s.TargetPath='%DIST_DIR%\DAWStream.exe';$s.WorkingDirectory='%DIST_DIR%';$s.Description='DAWStream - Discord DAW Streaming';$s.Save()"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=(New-Object -COM WScript.Shell).CreateShortcut((Join-Path ([Environment]::GetFolderPath('Desktop')) 'DAWStream.lnk'));$s.TargetPath=(Join-Path $env:DIST_DIR 'DAWStream.exe');$s.WorkingDirectory=$env:DIST_DIR;$s.Description='DAWStream - Discord DAW Streaming';$s.Save()"
 echo   OK: Desktop\DAWStream.lnk
 
 echo.

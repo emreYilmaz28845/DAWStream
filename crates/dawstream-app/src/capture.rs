@@ -15,6 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect, IsIc
 /// `PW_RENDERFULLCONTENT` (0x00000002) captures Direct2D / DWM / hardware-accelerated windows.
 const PW_RENDERFULLCONTENT: u32 = 0x0000_0002;
 const PW_CLIENTONLY: u32 = 0x0000_0001;
+const MAX_CAPTURE_DIM: i32 = 8192;
 
 pub struct CapturedFrame {
     pub width: usize,
@@ -110,6 +111,7 @@ fn capture_loop(
     let mut cached_h: i32 = 0;
     let mut mem_dc = windows::Win32::Graphics::Gdi::HDC::default();
     let mut bitmap = windows::Win32::Graphics::Gdi::HBITMAP::default();
+    let mut old_obj = windows::Win32::Graphics::Gdi::HGDIOBJ::default();
     let mut bits_ptr: *mut c_void = std::ptr::null_mut();
 
     while running.load(Ordering::Acquire) {
@@ -146,13 +148,17 @@ fn capture_loop(
                 flags = PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT);
             }
 
-            if width <= 0 || height <= 0 {
+            if width <= 0 || height <= 0 || width > MAX_CAPTURE_DIM || height > MAX_CAPTURE_DIM {
                 thread::sleep(Duration::from_millis(50));
                 continue;
             }
 
             // Re-allocate DIB only when dimensions change
             if width != cached_w || height != cached_h || mem_dc.0.is_null() {
+                if !old_obj.0.is_null() && !mem_dc.0.is_null() {
+                    SelectObject(mem_dc, old_obj);
+                    old_obj = Default::default();
+                }
                 if !bitmap.0.is_null() {
                     let _ = DeleteObject(bitmap);
                     bitmap = Default::default();
@@ -183,7 +189,7 @@ fn capture_loop(
                     Ok(bmp) if !ptr.is_null() => {
                         bitmap = bmp;
                         bits_ptr = ptr;
-                        SelectObject(mem_dc, bitmap);
+                        old_obj = SelectObject(mem_dc, bitmap);
                         cached_w = width;
                         cached_h = height;
                     }
@@ -199,8 +205,12 @@ fn capture_loop(
             }
 
             if PrintWindow(hwnd, mem_dc, flags).as_bool() {
-                let pixel_count = (width as usize) * (height as usize);
-                let byte_len = pixel_count * 4;
+                let Some(pixel_count) = (width as usize).checked_mul(height as usize) else {
+                    continue;
+                };
+                let Some(byte_len) = pixel_count.checked_mul(4) else {
+                    continue;
+                };
                 let src = std::slice::from_raw_parts(bits_ptr as *const u8, byte_len);
 
                 let mut rgba = vec![0u8; byte_len];
@@ -241,6 +251,9 @@ fn capture_loop(
 
     // Cleanup GDI handles
     unsafe {
+        if !old_obj.0.is_null() && !mem_dc.0.is_null() {
+            SelectObject(mem_dc, old_obj);
+        }
         if !bitmap.0.is_null() {
             let _ = DeleteObject(bitmap);
         }

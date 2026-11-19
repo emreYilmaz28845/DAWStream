@@ -85,15 +85,28 @@ struct EditorUiState {
     launch_error: Option<(String, Instant)>,
 }
 
+fn is_allowed_companion_exe(p: &std::path::Path) -> bool {
+    if !p.is_file() {
+        return false;
+    }
+    match p.file_name().and_then(|n| n.to_str()) {
+        Some(name) => {
+            let lower = name.to_ascii_lowercase();
+            lower == "dawstream.exe" || lower == "dawstream-app.exe"
+        }
+        None => false,
+    }
+}
+
 fn find_dawstream_exe() -> Option<PathBuf> {
-    // 1. Registered path saved by DAWStream.exe on startup
+    // 1. Registered path saved by DAWStream.exe on startup (strictly validated)
     if let Some(appdata) = std::env::var_os("APPDATA") {
         let cfg_path = PathBuf::from(appdata).join("DAWStream").join("config.json");
         if let Ok(text) = std::fs::read_to_string(cfg_path) {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
                 if let Some(exe_str) = val.get("app_exe_path").and_then(|v| v.as_str()) {
                     let p = PathBuf::from(exe_str);
-                    if p.exists() {
+                    if is_allowed_companion_exe(&p) {
                         return Some(p);
                     }
                 }
@@ -106,13 +119,13 @@ fn find_dawstream_exe() -> Option<PathBuf> {
         let p = PathBuf::from(local_app)
             .join("DAWStream")
             .join("DAWStream.exe");
-        if p.exists() {
+        if is_allowed_companion_exe(&p) {
             return Some(p);
         }
     }
 
     let pf = PathBuf::from(r"C:\Program Files\DAWStream\DAWStream.exe");
-    if pf.exists() {
+    if is_allowed_companion_exe(&pf) {
         return Some(pf);
     }
 
@@ -125,18 +138,6 @@ fn launch_companion_app() -> Result<(), String> {
             .spawn()
             .map_err(|e| format!("Launch error: {e}"))?;
         return Ok(());
-    }
-
-    // Fallback: Desktop shortcut created by Install.bat
-    if let Some(profile) = std::env::var_os("USERPROFILE") {
-        let lnk = PathBuf::from(profile).join("Desktop").join("DAWStream.lnk");
-        if lnk.exists() {
-            Command::new("cmd")
-                .args(["/C", "start", "", &lnk.to_string_lossy()])
-                .spawn()
-                .map_err(|e| format!("Launch error: {e}"))?;
-            return Ok(());
-        }
     }
 
     Err("DAWStream.exe not found — open it once first".into())

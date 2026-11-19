@@ -12,11 +12,60 @@ use capture::WindowCapturer;
 use config::AppConfig;
 use eframe::egui;
 use window_list::{list_windows, WindowInfo};
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
+use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::UI::WindowsAndMessaging::{
+    FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
+};
+
+const APP_WINDOW_TITLE: &str = "DAWStream — Discord DAW Streaming";
+
+struct SingleInstanceGuard(HANDLE);
+
+impl SingleInstanceGuard {
+    /// Returns `None` if another instance of DAWStream.exe is already running
+    /// (and brings the existing window to the foreground).
+    fn acquire() -> Option<Self> {
+        let name: Vec<u16> = "Local\\DAWStream_AppSingleInstance_v1\0"
+            .encode_utf16()
+            .collect();
+        unsafe {
+            let Ok(handle) = CreateMutexW(None, false, PCWSTR(name.as_ptr())) else {
+                return Some(Self(HANDLE::default()));
+            };
+            if GetLastError() == ERROR_ALREADY_EXISTS {
+                let title: Vec<u16> = format!("{APP_WINDOW_TITLE}\0").encode_utf16().collect();
+                if let Ok(hwnd) = FindWindowW(None, PCWSTR(title.as_ptr())) {
+                    let _ = ShowWindow(hwnd, SW_RESTORE);
+                    let _ = SetForegroundWindow(hwnd);
+                }
+                let _ = CloseHandle(handle);
+                return None;
+            }
+            Some(Self(handle))
+        }
+    }
+}
+
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() && !self.0 .0.is_null() {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+}
 
 fn main() -> eframe::Result<()> {
+    let Some(_instance_guard) = SingleInstanceGuard::acquire() else {
+        return Ok(());
+    };
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("DAWStream — Discord DAW Streaming")
+            .with_title(APP_WINDOW_TITLE)
             .with_inner_size([1280.0, 760.0])
             .with_min_inner_size([640.0, 400.0]),
         ..Default::default()
