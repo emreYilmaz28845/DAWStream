@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dawstream-ipc",
+    "crates/dawstream-vst3",
+    "crates/dawstream-app",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+opt-level = 3

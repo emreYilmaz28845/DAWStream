@@ -1,0 +1,60 @@
+name: Build & Release (Windows x64)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build VST3 & CLAP plugins
+        run: cargo xtask bundle dawstream-vst3 --release
+
+      - name: Build DAWStream companion app
+        run: cargo build --release -p dawstream-app
+
+      - name: Package release archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "release/DAWStream" | Out-Null
+          Copy-Item "target/release/dawstream-app.exe" "release/DAWStream/DAWStream.exe" -Force
+          Copy-Item "target/bundled/dawstream-vst3.vst3" "release/DAWStream/DAWStream.vst3" -Recurse -Force
+          if (Test-Path "target/bundled/dawstream-vst3.clap") {
+            Copy-Item "target/bundled/dawstream-vst3.clap" "release/DAWStream/DAWStream.clap" -Force
+          }
+          Copy-Item "Install.bat" "release/DAWStream/Install.bat" -Force
+          Copy-Item "README.md" "release/DAWStream/README.md" -Force
+          Copy-Item "LICENSE" "release/DAWStream/LICENSE" -Force
+
+          $tag = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME } else { "dev" }
+          $zipName = "DAWStream-$tag-windows-x64.zip"
+          Compress-Archive -Path "release/DAWStream/*" -DestinationPath $zipName -Force
+          echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DAWStream-windows-x64
+          path: ${{ env.ZIP_NAME }}
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP_NAME }}
+          generate_release_notes: true
