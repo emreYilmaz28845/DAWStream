@@ -12,7 +12,16 @@ use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::Security::{
     GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
 };
+use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows_sys::Win32::UI::Shell::{
+    FOLDERID_LocalAppData, FOLDERID_ProgramFiles, FOLDERID_RoamingAppData, SHGetKnownFolderPath,
+};
+use windows_sys::core::GUID;
+
+const DRIVE_REMOTE: u32 = 4;
+const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 
 pub struct DawStreamPlugin {
     params: Arc<DawStreamParams>,
@@ -118,9 +127,55 @@ fn is_process_elevated() -> bool {
     }
 }
 
-/// Validates that a candidate path is a local, absolute, non-UNC executable
-/// named `DAWStream.exe` (or `dawstream-app.exe`), preventing SMB NTLMv2 leaks
-/// and arbitrary binary execution.
+/// Resolves a Windows Known Folder via `SHGetKnownFolderPath` instead of trusting
+/// user-overridable environment variables (`%ProgramFiles%`, `%APPDATA%`, `%LOCALAPPDATA%`).
+fn known_folder(id: &GUID) -> Option<PathBuf> {
+    unsafe {
+        let mut raw: *mut u16 = std::ptr::null_mut();
+        let hr = SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &mut raw);
+        if hr != 0 || raw.is_null() {
+            return None;
+        }
+        let mut len = 0usize;
+        while *raw.add(len) != 0 {
+            len += 1;
+        }
+        let slice = std::slice::from_raw_parts(raw, len);
+        let s = String::from_utf16_lossy(slice);
+        CoTaskMemFree(raw as *const _);
+        if s.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(s))
+        }
+    }
+}
+
+/// Returns `false` if the path's drive root is a remote/network drive (`DRIVE_REMOTE`).
+fn is_not_remote_drive(p: &Path) -> bool {
+    let s = p.to_string_lossy();
+    let bytes = s.as_bytes();
+    if bytes.len() < 3 || bytes[1] != b':' || (bytes[2] != b'\\' && bytes[2] != b'/') {
+        return false;
+    }
+    let root: [u16; 4] = [bytes[0] as u16, b':' as u16, b'\\' as u16, 0];
+    let dtype = unsafe { GetDriveTypeW(root.as_ptr()) };
+    dtype != DRIVE_REMOTE
+}
+
+fn is_allowed_exe_name(p: &Path) -> bool {
+    p.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| {
+            let lower = n.to_ascii_lowercase();
+            lower == "dawstream.exe" || lower == "dawstream-app.exe"
+        })
+        .unwrap_or(false)
+}
+
+/// Validates that a candidate path is a local, absolute, non-UNC, non-remote executable
+/// named `DAWStream.exe` (or `dawstream-app.exe`), re-checking the basename AFTER
+/// canonicalization to defeat symlink-name bypasses.
 fn validate_companion_exe(raw: &str) -> Option<PathBuf> {
     let trimmed = raw.trim();
     if trimmed.starts_with(r"\\") || trimmed.starts_with("//") {
@@ -128,12 +183,7 @@ fn validate_companion_exe(raw: &str) -> Option<PathBuf> {
     }
 
     let p = Path::new(trimmed);
-    if !p.is_absolute() {
-        return None;
-    }
-
-    let name = p.file_name()?.to_str()?.to_ascii_lowercase();
-    if name != "dawstream.exe" && name != "dawstream-app.exe" {
+    if !p.is_absolute() || !is_not_remote_drive(p) || !is_allowed_exe_name(p) {
         return None;
     }
 
@@ -143,7 +193,8 @@ fn validate_companion_exe(raw: &str) -> Option<PathBuf> {
         return None;
     }
 
-    if !canonical.is_file() {
+    // Re-check file name AFTER resolving symlinks/junctions (closes MEDIUM #13)
+    if !is_allowed_exe_name(&canonical) || !canonical.is_file() {
         return None;
     }
 
@@ -151,40 +202,41 @@ fn validate_companion_exe(raw: &str) -> Option<PathBuf> {
 }
 
 fn find_dawstream_exe(elevated: bool) -> Option<PathBuf> {
-    // 1. Always check admin-protected Program Files FIRST (highest trust)
-    let pf_base = std::env::var_os("ProgramFiles")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
+    // 1. Always check admin-protected Program Files via SHGetKnownFolderPath (never %ProgramFiles%)
+    let pf_base = known_folder(&FOLDERID_ProgramFiles)?;
     let pf_exe = pf_base.join("DAWStream").join("DAWStream.exe");
     if let Some(valid) = pf_exe.to_str().and_then(validate_companion_exe) {
         return Some(valid);
     }
 
-    // Security guard (HIGH-1): if the DAW is running elevated (Administrator),
-    // NEVER launch an executable from a user-writable directory (%LOCALAPPDATA% or config.json),
-    // which would allow medium-IL -> high-IL privilege escalation.
+    // Security guard: if the DAW is running elevated (Administrator),
+    // NEVER launch an executable from a user-writable directory.
     if elevated {
         return None;
     }
 
-    // 2. Per-user standard install location (only when DAW is non-elevated)
-    if let Some(local_app) = std::env::var_os("LOCALAPPDATA") {
-        let p = PathBuf::from(local_app)
-            .join("DAWStream")
-            .join("DAWStream.exe");
+    // 2. Per-user standard install location (via SHGetKnownFolderPath)
+    if let Some(local_app) = known_folder(&FOLDERID_LocalAppData) {
+        let p = local_app.join("DAWStream").join("DAWStream.exe");
         if let Some(valid) = p.to_str().and_then(validate_companion_exe) {
             return Some(valid);
         }
     }
 
-    // 3. Registered path saved by DAWStream.exe (only when DAW is non-elevated)
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        let cfg_path = PathBuf::from(appdata).join("DAWStream").join("config.json");
-        if let Ok(text) = std::fs::read_to_string(cfg_path) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let Some(exe_str) = val.get("app_exe_path").and_then(|v| v.as_str()) {
-                    if let Some(valid) = validate_companion_exe(exe_str) {
-                        return Some(valid);
+    // 3. Registered path saved by DAWStream.exe (only when DAW is non-elevated, size-capped)
+    if let Some(appdata) = known_folder(&FOLDERID_RoamingAppData) {
+        if is_not_remote_drive(&appdata) {
+            let cfg_path = appdata.join("DAWStream").join("config.json");
+            if let Ok(meta) = std::fs::metadata(&cfg_path) {
+                if meta.is_file() && meta.len() <= MAX_CONFIG_BYTES {
+                    if let Ok(text) = std::fs::read_to_string(&cfg_path) {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if let Some(exe_str) = val.get("app_exe_path").and_then(|v| v.as_str()) {
+                                if let Some(valid) = validate_companion_exe(exe_str) {
+                                    return Some(valid);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -259,6 +311,11 @@ impl Plugin for DawStreamPlugin {
     }
 
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        // Prevent glutin WGL backend from loading an attacker-supplied DLL via GLUTIN_WGL_OPENGL_DLL
+        unsafe {
+            std::env::remove_var("GLUTIN_WGL_OPENGL_DLL");
+        }
+
         let params = self.params.clone();
         let ring = self
             .ring

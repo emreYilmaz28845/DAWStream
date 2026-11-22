@@ -13,7 +13,9 @@ use config::AppConfig;
 use eframe::egui;
 use window_list::{list_windows, WindowInfo};
 use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
+use windows::Win32::Foundation::{
+    CloseHandle, GetLastError, SetLastError, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE,
+};
 use windows::Win32::System::LibraryLoader::{
     SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_SYSTEM32,
 };
@@ -71,6 +73,7 @@ impl SingleInstanceGuard {
             .encode_utf16()
             .collect();
         unsafe {
+            SetLastError(ERROR_SUCCESS);
             let Ok(handle) = CreateMutexW(None, false, PCWSTR(name.as_ptr())) else {
                 // Fail closed rather than allowing concurrent readers on the SPSC ring
                 return None;
@@ -102,8 +105,9 @@ impl Drop for SingleInstanceGuard {
 }
 
 fn main() -> eframe::Result<()> {
-    // Harden DLL search order against CWD / Downloads DLL hijacking
+    // Prevent glutin WGL backend from loading an attacker-supplied DLL via GLUTIN_WGL_OPENGL_DLL
     unsafe {
+        std::env::remove_var("GLUTIN_WGL_OPENGL_DLL");
         let _ = SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
     }
 
@@ -128,7 +132,7 @@ fn main() -> eframe::Result<()> {
 
 struct DawStreamApp {
     windows: Vec<WindowInfo>,
-    selected_hwnd: Option<isize>,
+    selected_target: Option<(isize, u32)>,
 
     devices: Vec<AudioOutputDevice>,
     selected_device_id: Option<String>,
@@ -158,7 +162,6 @@ impl DawStreamApp {
 
         let windows = list_windows();
         let selected_target = windows.iter().find(|w| w.is_daw).map(|w| (w.hwnd, w.pid));
-        let selected_hwnd = selected_target.map(|(h, _)| h);
 
         let devices = list_output_devices();
         let selected_device_id = saved
@@ -178,7 +181,7 @@ impl DawStreamApp {
 
         let app = Self {
             windows,
-            selected_hwnd,
+            selected_target,
             devices,
             selected_device_id,
             audio_engine,
@@ -211,17 +214,19 @@ impl DawStreamApp {
 
     fn refresh_windows(&mut self) {
         self.windows = list_windows();
-        if let Some(hwnd) = self.selected_hwnd {
-            if let Some(w) = self.windows.iter().find(|w| w.hwnd == hwnd) {
-                self.capturer.set_target(Some((w.hwnd, w.pid)));
+        if let Some((hwnd, pid)) = self.selected_target {
+            // Require BOTH hwnd and pid to match so a recycled HWND never re-arms on a new process
+            if self.windows.iter().any(|w| w.hwnd == hwnd && w.pid == pid) {
+                self.capturer.set_target(Some((hwnd, pid)));
             } else {
                 let daw = self.windows.iter().find(|w| w.is_daw).map(|w| (w.hwnd, w.pid));
-                self.selected_hwnd = daw.map(|(h, _)| h);
+                self.selected_target = daw;
                 self.capturer.set_target(daw);
+                self.mirror_texture = None;
             }
         } else if let Some(daw) = self.windows.iter().find(|w| w.is_daw) {
-            self.selected_hwnd = Some(daw.hwnd);
-            self.capturer.set_target(Some((daw.hwnd, daw.pid)));
+            self.selected_target = Some((daw.hwnd, daw.pid));
+            self.capturer.set_target(self.selected_target);
         }
     }
 
@@ -279,7 +284,12 @@ impl eframe::App for DawStreamApp {
             self.hide_toolbar = !self.hide_toolbar;
         }
 
-        if let Some(frame) = self.capturer.take_if_newer(self.last_frame_seq) {
+        if !self.capturer.has_active_target() {
+            if self.mirror_texture.is_some() {
+                self.mirror_texture = None;
+            }
+            self.selected_target = None;
+        } else if let Some(frame) = self.capturer.take_if_newer(self.last_frame_seq) {
             self.last_frame_seq = frame.seq;
             let color_image =
                 egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.rgba);
@@ -351,7 +361,7 @@ impl eframe::App for DawStreamApp {
                         let current_win_label = self
                             .windows
                             .iter()
-                            .find(|w| Some(w.hwnd) == self.selected_hwnd)
+                            .find(|w| Some((w.hwnd, w.pid)) == self.selected_target)
                             .map(|w| truncate_str(&w.title, 28))
                             .unwrap_or_else(|| "Select window...".into());
 
@@ -360,10 +370,10 @@ impl eframe::App for DawStreamApp {
                             .width(200.0)
                             .show_ui(ui, |ui| {
                                 if ui
-                                    .selectable_label(self.selected_hwnd.is_none(), "(No Video)")
+                                    .selectable_label(self.selected_target.is_none(), "(No Video)")
                                     .clicked()
                                 {
-                                    self.selected_hwnd = None;
+                                    self.selected_target = None;
                                     self.capturer.set_target(None);
                                     self.mirror_texture = None;
                                 }
@@ -375,13 +385,14 @@ impl eframe::App for DawStreamApp {
                                     };
                                     if ui
                                         .selectable_label(
-                                            self.selected_hwnd == Some(win.hwnd),
+                                            self.selected_target == Some((win.hwnd, win.pid)),
                                             label,
                                         )
                                         .clicked()
                                     {
-                                        self.selected_hwnd = Some(win.hwnd);
-                                        self.capturer.set_target(Some((win.hwnd, win.pid)));
+                                        self.selected_target = Some((win.hwnd, win.pid));
+                                        self.capturer.set_target(self.selected_target);
+                                        self.mirror_texture = None;
                                     }
                                 }
                             });
@@ -557,7 +568,7 @@ impl eframe::App for DawStreamApp {
             }
         }
 
-        if self.selected_hwnd.is_some() {
+        if self.selected_target.is_some() {
             ctx.request_repaint_after(Duration::from_millis(16));
         } else {
             ctx.request_repaint_after(Duration::from_millis(66));

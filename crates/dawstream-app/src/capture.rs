@@ -11,7 +11,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindow,
+    GetClientRect, GetWindowDisplayAffinity, GetWindowRect, GetWindowThreadProcessId, IsIconic,
+    IsWindow, WDA_EXCLUDEFROMCAPTURE, WDA_MONITOR,
 };
 
 /// `PW_RENDERFULLCONTENT` (0x00000002) captures Direct2D / DWM / hardware-accelerated windows.
@@ -97,6 +98,10 @@ impl WindowCapturer {
         None
     }
 
+    pub fn has_active_target(&self) -> bool {
+        self.target_hwnd.load(Ordering::Acquire) != 0
+    }
+
     pub fn fps(&self) -> f32 {
         self.fps_x10.load(Ordering::Relaxed) as f32 / 10.0
     }
@@ -104,10 +109,10 @@ impl WindowCapturer {
 
 impl Drop for WindowCapturer {
     fn drop(&mut self) {
+        // Signal the capture thread to stop and detach instead of blocking forever
+        // if a hung target window is currently stalling inside synchronous PrintWindow().
         self.running.store(false, Ordering::Release);
-        if let Some(h) = self.thread.take() {
-            let _ = h.join();
-        }
+        let _ = self.thread.take();
     }
 }
 
@@ -144,7 +149,26 @@ fn capture_loop(
         let hwnd = HWND(raw_hwnd as *mut c_void);
 
         unsafe {
-            if !IsWindow(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+            if !IsWindow(hwnd).as_bool() {
+                target_hwnd.store(0, Ordering::Release);
+                target_pid.store(0, Ordering::Release);
+                fps_x10.store(0, Ordering::Relaxed);
+                if let Ok(mut guard) = latest_frame.lock() {
+                    *guard = None;
+                }
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            if IsIconic(hwnd).as_bool() {
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+
+            // Respect Windows display affinity (skip capture-protected windows)
+            let mut affinity: u32 = 0;
+            if GetWindowDisplayAffinity(hwnd, &mut affinity).is_ok()
+                && (affinity == WDA_EXCLUDEFROMCAPTURE.0 || affinity == WDA_MONITOR.0)
+            {
                 thread::sleep(Duration::from_millis(50));
                 continue;
             }
@@ -167,8 +191,8 @@ fn capture_loop(
 
             let mut rect = RECT::default();
             let got_client = GetClientRect(hwnd, &mut rect).is_ok();
-            let mut width = rect.right - rect.left;
-            let mut height = rect.bottom - rect.top;
+            let mut width = rect.right.checked_sub(rect.left).unwrap_or(0);
+            let mut height = rect.bottom.checked_sub(rect.top).unwrap_or(0);
             let mut flags = PRINT_WINDOW_FLAGS(PW_CLIENTONLY | PW_RENDERFULLCONTENT);
 
             if !got_client || width <= 0 || height <= 0 {
@@ -176,8 +200,8 @@ fn capture_loop(
                     thread::sleep(Duration::from_millis(50));
                     continue;
                 }
-                width = rect.right - rect.left;
-                height = rect.bottom - rect.top;
+                width = rect.right.checked_sub(rect.left).unwrap_or(0);
+                height = rect.bottom.checked_sub(rect.top).unwrap_or(0);
                 flags = PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT);
             }
 
@@ -194,6 +218,7 @@ fn capture_loop(
                 if !bitmap.0.is_null() {
                     let _ = DeleteObject(bitmap);
                     bitmap = Default::default();
+                    bits_ptr = std::ptr::null_mut();
                 }
                 if !mem_dc.0.is_null() {
                     let _ = DeleteDC(mem_dc);

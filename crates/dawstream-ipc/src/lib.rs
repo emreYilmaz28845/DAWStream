@@ -126,8 +126,9 @@ impl SharedAudioRing {
 
         unsafe {
             // Restrict section access to current user (Owner) + Administrators,
-            // and enforce Medium Integrity Level to block AppContainer / Low-IL processes.
-            let sddl: Vec<u16> = OsStr::new("D:P(A;;GA;;;OW)(A;;GA;;;BA)S:(ML;;NW;;;ME)")
+            // and enforce Medium Integrity Level with No-Read-Up + No-Write-Up (NRNW)
+            // to block AppContainer / Low-IL processes from both reading and writing.
+            let sddl: Vec<u16> = OsStr::new("D:P(A;;GA;;;OW)(A;;GA;;;BA)S:(ML;;NRNW;;;ME)")
                 .encode_wide()
                 .chain(std::iter::once(0))
                 .collect();
@@ -429,8 +430,9 @@ impl SharedAudioRing {
         let now = now_tick_ms();
         let last_tick = b.owner_last_tick_ms.load(Ordering::Acquire);
         let stale = owner == 0
-            || (last_tick != 0
-                && (last_tick > now || now.saturating_sub(last_tick) > OWNER_LEASE_TIMEOUT_MS));
+            || last_tick == 0
+            || last_tick > now
+            || now.saturating_sub(last_tick) > OWNER_LEASE_TIMEOUT_MS;
 
         if stale
             && b.active_owner_id
