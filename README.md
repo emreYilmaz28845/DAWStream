@@ -77,6 +77,10 @@ In the list above, `Realtek Digital Output` is the safe pick. The `[!]` entries 
 2. Turn on sound sharing if Discord asks.
 3. Press **H** in DAWStream to hide the toolbar so your viewers only see the DAW. Press **H** again (or move the mouse to the top edge) to bring it back.
 
+This is what it looks like in Discord. The bottom-left panel shows that the DAWStream window is being shared, and your viewers see the DAW and hear its audio:
+
+![DAWStream being streamed live in a Discord voice channel](docs/images/discord.jpg)
+
 ### Controls
 
 | Where | Control | What it does |
