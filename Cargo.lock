@@ -971,7 +971,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "dawstream-app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "dawstream-ipc",
  "eframe",
@@ -984,14 +984,14 @@ dependencies = [
 
 [[package]]
 name = "dawstream-ipc"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "dawstream-vst3"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "dawstream-ipc",
  "nih_plug",
@@ -4724,7 +4724,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "nih_plug_xtask",
 ]
