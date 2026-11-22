@@ -278,7 +278,7 @@ fn ensure_instance_id(ring: &SharedAudioRing, slot: &AtomicU64) -> u64 {
 impl Plugin for DawStreamPlugin {
     const NAME: &'static str = "DAWStream";
     const VENDOR: &'static str = "DAWStream";
-    const URL: &'static str = "https://github.com/dawstream/dawstream";
+    const URL: &'static str = "https://github.com/emreYilmaz28845/DAWStream";
     const EMAIL: &'static str = "";
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
