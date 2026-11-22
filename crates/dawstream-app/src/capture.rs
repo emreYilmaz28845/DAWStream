@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use eframe::egui::Color32;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
@@ -24,7 +25,9 @@ const MAX_CAPTURE_DIM: i32 = 4096;
 pub struct CapturedFrame {
     pub width: usize,
     pub height: usize,
-    pub rgba: Vec<u8>,
+    /// Opaque pixels in egui's layout, so the UI thread can hand them to the texture
+    /// without another full-frame conversion (alpha is 255, so premultiplied == straight).
+    pub pixels: Vec<Color32>,
     pub seq: u64,
 }
 
@@ -297,25 +300,24 @@ fn capture_loop(
                 let Some(pixel_count) = (width as usize).checked_mul(height as usize) else {
                     continue;
                 };
-                let Some(byte_len) = pixel_count.checked_mul(4) else {
+                if pixel_count.checked_mul(4).is_none() {
                     continue;
-                };
-                let src = std::slice::from_raw_parts(bits_ptr as *const u8, byte_len);
-
-                let mut rgba = vec![0u8; byte_len];
-                for (dst_px, src_px) in rgba.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
-                    dst_px[0] = src_px[2]; // R
-                    dst_px[1] = src_px[1]; // G
-                    dst_px[2] = src_px[0]; // B
-                    dst_px[3] = 255;       // A
                 }
+                // CreateDIBSection bits are DWORD-aligned, so reading them as u32 (0xAARRGGBB) is valid.
+                let src = std::slice::from_raw_parts(bits_ptr as *const u32, pixel_count);
+
+                // One pass, no zero-fill: BGRA -> egui RGBA, alpha forced opaque.
+                let pixels: Vec<Color32> = src
+                    .iter()
+                    .map(|&p| Color32::from_rgba_premultiplied((p >> 16) as u8, (p >> 8) as u8, p as u8, 255))
+                    .collect();
 
                 seq += 1;
                 if let Ok(mut guard) = latest_frame.lock() {
                     *guard = Some(CapturedFrame {
                         width: width as usize,
                         height: height as usize,
-                        rgba,
+                        pixels,
                         seq,
                     });
                 }

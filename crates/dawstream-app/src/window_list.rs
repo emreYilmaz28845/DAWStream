@@ -8,8 +8,9 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetWindowLongW, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, IsIconic, IsWindowVisible, GWL_EXSTYLE, WS_EX_TOOLWINDOW,
+    EnumWindows, GetClassNameW, GetWindow, GetWindowLongW, GetWindowPlacement, GetWindowRect,
+    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, GWL_EXSTYLE, GW_OWNER,
+    WINDOWPLACEMENT, WS_EX_TOOLWINDOW,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -18,6 +19,19 @@ pub struct WindowInfo {
     pub pid: u32,
     pub title: String,
     pub is_daw: bool,
+    /// How likely this is the DAW's *main* window (higher = better); 0 for non-DAW windows.
+    /// DAWs own many top-level windows (plugin GUIs, FX chains, mixers) from the same exe.
+    pub daw_rank: u8,
+    /// Restored-size area in pixels, used to prefer the big arrange window among candidates.
+    pub area: i64,
+}
+
+/// The best auto-select candidate: the highest-ranked, then largest, DAW window.
+pub fn best_daw_window(windows: &[WindowInfo]) -> Option<&WindowInfo> {
+    windows
+        .iter()
+        .filter(|w| w.is_daw)
+        .max_by_key(|w| (w.daw_rank, w.area))
 }
 
 const NON_DAW_CLASSES: &[&str] = &[
@@ -78,20 +92,27 @@ fn process_exe_stem(pid: u32) -> Option<String> {
     }
 }
 
-fn is_daw_window(class_name: &str, exe_stem: Option<&str>) -> bool {
+/// Rank of a window as a DAW main-window candidate (0 = not a DAW window):
+/// 3 = known DAW main-window class, 2 = unowned window of a DAW exe,
+/// 1 = owned window of a DAW exe (floating plugin GUI, FX chain, dialog).
+fn daw_rank(class_name: &str, exe_stem: Option<&str>, owned: bool) -> u8 {
     let class_lower = class_name.to_lowercase();
     if NON_DAW_CLASSES.iter().any(|c| class_lower == *c) {
-        return false;
+        return 0;
     }
 
     if DAW_CLASS_PREFIXES
         .iter()
         .any(|p| class_lower.starts_with(p))
     {
-        return true;
+        return 3;
     }
 
-    exe_stem.map(is_daw_exe).unwrap_or(false)
+    match exe_stem.map(is_daw_exe) {
+        Some(true) if owned => 1,
+        Some(true) => 2,
+        _ => 0,
+    }
 }
 
 struct EnumState {
@@ -103,7 +124,9 @@ struct EnumState {
 unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let state = &mut *(lparam.0 as *mut EnumState);
 
-    if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+    // Minimized windows are listed too (a minimized DAW must still be auto-selectable;
+    // the capturer simply waits until it is restored).
+    if !IsWindowVisible(hwnd).as_bool() {
         return BOOL(1);
     }
 
@@ -130,7 +153,18 @@ unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
     }
 
     let mut rect = RECT::default();
-    if GetWindowRect(hwnd, &mut rect).is_err() {
+    if IsIconic(hwnd).as_bool() {
+        // A minimized window's live rect is a tiny caption at (-32000, -32000); use its
+        // restored size instead.
+        let mut wp = WINDOWPLACEMENT {
+            length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+            ..Default::default()
+        };
+        if GetWindowPlacement(hwnd, &mut wp).is_err() {
+            return BOOL(1);
+        }
+        rect = wp.rcNormalPosition;
+    } else if GetWindowRect(hwnd, &mut rect).is_err() {
         return BOOL(1);
     }
     if rect.right.saturating_sub(rect.left) < 100 || rect.bottom.saturating_sub(rect.top) < 80 {
@@ -161,12 +195,17 @@ unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
         .exe_cache
         .entry(pid)
         .or_insert_with(|| process_exe_stem(pid));
-    let is_daw = is_daw_window(&class_name, exe_stem.as_deref());
+    let owned = GetWindow(hwnd, GW_OWNER).map(|h| !h.0.is_null()).unwrap_or(false);
+    let rank = daw_rank(&class_name, exe_stem.as_deref(), owned);
+    let area = (rect.right.saturating_sub(rect.left) as i64)
+        * (rect.bottom.saturating_sub(rect.top) as i64);
     state.windows.push(WindowInfo {
         hwnd: hwnd.0 as isize,
         pid,
         title,
-        is_daw,
+        is_daw: rank > 0,
+        daw_rank: rank,
+        area,
     });
 
     BOOL(1)
@@ -186,9 +225,12 @@ pub fn list_windows() -> Vec<WindowInfo> {
         );
     }
 
+    // DAW windows first, main-window candidates (then larger windows) before plugin GUIs;
+    // everything else alphabetically.
     state.windows.sort_by(|a, b| {
-        b.is_daw
-            .cmp(&a.is_daw)
+        b.daw_rank
+            .cmp(&a.daw_rank)
+            .then_with(|| if a.is_daw { b.area.cmp(&a.area) } else { std::cmp::Ordering::Equal })
             .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
     });
 

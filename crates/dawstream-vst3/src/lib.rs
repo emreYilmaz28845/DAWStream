@@ -29,6 +29,8 @@ pub struct DawStreamPlugin {
     instance_id: Arc<AtomicU64>,
     /// Host sample rate from `initialize()`, published by whichever instance owns the stream.
     sample_rate: u32,
+    /// Largest block seen since `initialize()`; published so the app can size its cushion.
+    max_block: u32,
 }
 
 impl Drop for DawStreamPlugin {
@@ -89,6 +91,7 @@ impl Default for DawStreamPlugin {
             ring,
             instance_id: Arc::new(AtomicU64::new(id)),
             sample_rate: 48_000,
+            max_block: 0,
         }
     }
 }
@@ -560,6 +563,8 @@ impl Plugin for DawStreamPlugin {
             self.ring = SharedAudioRing::open_or_create().ok().map(Arc::new);
         }
         self.sample_rate = buffer_config.sample_rate.round() as u32;
+        // Buffer size may have changed (initialize() re-runs on device/buffer changes).
+        self.max_block = 0;
         if let Some(ring) = &self.ring {
             let id = ensure_instance_id(ring, &self.instance_id);
             if ring.is_or_claim_owner(id) {
@@ -575,14 +580,18 @@ impl Plugin for DawStreamPlugin {
         _aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
+        // Always KeepAlive: `Normal` lets hosts suspend processing on silence (CLAP
+        // CONTINUE_IF_NOT_QUIET; VST3 kNoTail with e.g. Cubase's "suspend on silence"). That
+        // would stop the heartbeat, let the owner lease expire and hand the stream to another
+        // instance mid-session.
         let Some(ring) = &self.ring else {
-            return ProcessStatus::Normal;
+            return ProcessStatus::KeepAlive;
         };
 
         // Only the active owner instance writes to shared memory (prevents multi-instance glitches)
         let id = self.instance_id.load(Ordering::Acquire);
         if !ring.is_or_claim_owner(id) {
-            return ProcessStatus::Normal;
+            return ProcessStatus::KeepAlive;
         }
         // Always publish OUR rate: ownership may have moved here via Take Over / lease expiry
         if ring.sample_rate() != self.sample_rate {
@@ -591,8 +600,11 @@ impl Plugin for DawStreamPlugin {
 
         let num_samples = buffer.samples();
         if num_samples == 0 {
-            return ProcessStatus::Normal;
+            return ProcessStatus::KeepAlive;
         }
+        // Hosts like FL Studio deliver variable block sizes; the cushion must fit the largest.
+        self.max_block = self.max_block.max(num_samples as u32);
+        ring.set_producer_block_frames(self.max_block);
 
         let gain = self.params.stream_gain.smoothed.next_step(num_samples as u32);
         let muted = self.params.mute_stream.value();
@@ -604,7 +616,7 @@ impl Plugin for DawStreamPlugin {
             ring.write_planar(slices[0], slices[0], gain, muted);
         }
 
-        ProcessStatus::Normal
+        ProcessStatus::KeepAlive
     }
 }
 

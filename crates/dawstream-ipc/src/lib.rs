@@ -55,6 +55,9 @@ pub const RING_FRAMES: usize = 65_536;
 pub const RING_MASK: usize = RING_FRAMES - 1;
 pub const CHANNELS: usize = 2;
 
+/// Upper bound accepted for `producer_block_frames` (keeps the cushion well inside the ring).
+pub const MAX_PRODUCER_BLOCK: u64 = 8_192;
+
 /// Memory layout shared between the plugin (producer) and companion app (consumer).
 /// All fields are atomic to avoid any data races / UB across processes.
 #[repr(C, align(64))]
@@ -78,7 +81,10 @@ pub struct SharedAudioBlock {
 
     /// 0 = active, 1 = muted by plugin.
     pub plugin_muted: AtomicU32,
-    pub _pad0: u32,
+    /// Largest `process()` block (frames) the active producer has delivered. The consumer
+    /// sizes its latency cushion from it, because audio arrives in bursts of one DAW block.
+    /// 0 = unknown (older plugin build).
+    pub producer_block_frames: AtomicU32,
 
     /// Incremented by the companion app while actively reading audio.
     pub app_heartbeat: AtomicU64,
@@ -298,6 +304,7 @@ impl SharedAudioRing {
                 block_ref.peak_l_bits.store(0, Ordering::Release);
                 block_ref.peak_r_bits.store(0, Ordering::Release);
                 block_ref.plugin_muted.store(0, Ordering::Release);
+                block_ref.producer_block_frames.store(0, Ordering::Release);
                 block_ref.app_heartbeat.store(0, Ordering::Release);
                 block_ref.app_last_tick_ms.store(0, Ordering::Release);
                 block_ref.owner_lease.store(0, Ordering::Release);
@@ -350,6 +357,30 @@ impl SharedAudioRing {
         } else {
             48_000
         }
+    }
+
+    /// Producer: publishes the largest block size (frames) it delivers per `process()` call.
+    #[inline]
+    pub fn set_producer_block_frames(&self, frames: u32) {
+        let b = self.block();
+        if b.producer_block_frames.load(Ordering::Relaxed) != frames {
+            b.producer_block_frames.store(frames, Ordering::Relaxed);
+        }
+    }
+
+    /// Consumer: largest producer block size in frames (0 if unknown), capped to a sane bound.
+    #[inline]
+    pub fn producer_block_frames(&self) -> u64 {
+        (self.block().producer_block_frames.load(Ordering::Relaxed) as u64).min(MAX_PRODUCER_BLOCK)
+    }
+
+    /// Consumer: latency cushion (frames) that survives one producer burst plus one consumer
+    /// period of drain. `base_frames` is the minimum cushion (e.g. 20 ms), `consumer_period`
+    /// the typical number of frames pulled per read.
+    #[inline]
+    pub fn effective_target_latency(&self, base_frames: u64, consumer_period: u64) -> u64 {
+        let block = self.producer_block_frames();
+        base_frames.max(block + consumer_period + base_frames / 4)
     }
 
     /// Producer: writes stereo planar slices into the interleaved ring buffer.
@@ -443,9 +474,11 @@ impl SharedAudioRing {
         let max_drift = (target_latency_frames * 3).max(requested * 4);
         let mut available = wpos.wrapping_sub(rpos);
 
-        // Overrun (or cursor corruption): jump back to target latency.
+        // Overrun (or cursor corruption): jump back to target latency, keeping enough for this
+        // read too. Landing at exactly `target` would sit below the restart threshold
+        // (`target + requested`) and, with bursts larger than `max_drift`, never play again.
         if available > (RING_FRAMES as u64) || available > max_drift {
-            rpos = wpos.saturating_sub(target_latency_frames);
+            rpos = wpos.saturating_sub(target_latency_frames + requested);
             available = wpos.wrapping_sub(rpos);
         }
 
@@ -770,6 +803,56 @@ mod tests {
         assert_eq!(ring.read_interleaved(&mut out, 8), 0);
         ring.write_planar(&[0.5; 4], &[0.5; 4], 1.0, false);
         assert_eq!(ring.read_interleaved(&mut out, 8), 0);
+    }
+
+    /// Simulates a DAW delivering large bursts (4096-frame blocks) to a consumer pulling 480
+    /// frames per 10 ms period, in real-time proportion. With the block size published the
+    /// consumer must play continuously after the initial fill (no rebuffering, no skips).
+    #[test]
+    fn large_producer_blocks_play_without_gaps() {
+        let name = unique_name("bigblock");
+        let ring = SharedAudioRing::open_or_create_named(&name).unwrap();
+        ring.bump_app_heartbeat();
+        let (block, period, base) = (4096usize, 480usize, 960u64);
+        ring.set_producer_block_frames(block as u32);
+        let target = ring.effective_target_latency(base, period as u64);
+        ring.resync_consumer(target);
+
+        let src = vec![0.25f32; block];
+        let mut out = vec![0.0f32; period * 2];
+        let (mut produced, mut consumed) = (0usize, 0usize);
+        let (mut started, mut gaps) = (false, 0);
+        for _ in 0..2_000 {
+            // Producer catches up to the consumer's clock, one whole block at a time.
+            while produced <= consumed + period {
+                ring.write_planar(&src, &src, 1.0, false);
+                produced += block;
+            }
+            let n = ring.read_interleaved(&mut out, target);
+            consumed += period;
+            if n > 0 {
+                started = true;
+            }
+            if started && n < period {
+                gaps += 1;
+            }
+        }
+        assert!(started);
+        assert_eq!(gaps, 0);
+    }
+
+    /// A burst larger than the overrun threshold must not leave the consumer stuck in
+    /// buffering (it used to reset below the restart threshold and stay silent forever).
+    #[test]
+    fn overrun_reset_resumes_playback() {
+        let name = unique_name("overrun");
+        let ring = SharedAudioRing::open_or_create_named(&name).unwrap();
+        ring.bump_app_heartbeat();
+        ring.resync_consumer(960);
+        let burst = vec![0.5f32; 4096];
+        let mut out = vec![0.0f32; 960];
+        ring.write_planar(&burst, &burst, 1.0, false);
+        assert_eq!(ring.read_interleaved(&mut out, 960), 480);
     }
 
     #[test]

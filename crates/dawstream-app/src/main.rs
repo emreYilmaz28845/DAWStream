@@ -5,13 +5,17 @@ mod capture;
 mod config;
 mod window_list;
 
-use std::time::Duration;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use audio::{list_output_devices, AudioEngine, AudioOutputDevice, DeviceTier};
 use capture::WindowCapturer;
 use config::AppConfig;
 use eframe::egui;
-use window_list::{list_windows, WindowInfo};
+use window_list::{best_daw_window, list_windows, WindowInfo};
+
+/// How often to look for a DAW window while nothing is being captured.
+const AUTO_SCAN_INTERVAL: Duration = Duration::from_secs(2);
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, SetLastError, BOOL, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE,
@@ -157,6 +161,11 @@ fn main() -> eframe::Result<()> {
 struct DawStreamApp {
     windows: Vec<WindowInfo>,
     selected_target: Option<(isize, u32)>,
+    /// The user explicitly picked "(No Video)": don't auto-select a DAW behind their back.
+    no_video_chosen: bool,
+    /// Pending background window scan (EnumWindows + process queries stay off the UI thread).
+    scan_rx: Option<mpsc::Receiver<Vec<WindowInfo>>>,
+    last_scan: Instant,
 
     devices: Vec<AudioOutputDevice>,
     selected_device_id: Option<String>,
@@ -185,7 +194,7 @@ impl DawStreamApp {
         let saved = AppConfig::load();
 
         let windows = list_windows();
-        let selected_target = windows.iter().find(|w| w.is_daw).map(|w| (w.hwnd, w.pid));
+        let selected_target = best_daw_window(&windows).map(|w| (w.hwnd, w.pid));
 
         let devices = list_output_devices();
         let selected_device_id = saved
@@ -206,6 +215,9 @@ impl DawStreamApp {
         let app = Self {
             windows,
             selected_target,
+            no_video_chosen: false,
+            scan_rx: None,
+            last_scan: Instant::now(),
             devices,
             selected_device_id,
             audio_engine,
@@ -237,20 +249,56 @@ impl DawStreamApp {
     }
 
     fn refresh_windows(&mut self) {
+        self.no_video_chosen = false;
         self.windows = list_windows();
         if let Some((hwnd, pid)) = self.selected_target {
             // Require BOTH hwnd and pid to match so a recycled HWND never re-arms on a new process
             if self.windows.iter().any(|w| w.hwnd == hwnd && w.pid == pid) {
                 self.capturer.set_target(Some((hwnd, pid)));
             } else {
-                let daw = self.windows.iter().find(|w| w.is_daw).map(|w| (w.hwnd, w.pid));
+                let daw = best_daw_window(&self.windows).map(|w| (w.hwnd, w.pid));
                 self.selected_target = daw;
                 self.capturer.set_target(daw);
                 self.mirror_texture = None;
             }
-        } else if let Some(daw) = self.windows.iter().find(|w| w.is_daw) {
+        } else if let Some(daw) = best_daw_window(&self.windows) {
             self.selected_target = Some((daw.hwnd, daw.pid));
             self.capturer.set_target(self.selected_target);
+        }
+    }
+
+    /// While nothing is captured (DAW opened after DAWStream, or closed and reopened), scan
+    /// for a DAW window in the background and auto-select it once one appears.
+    fn poll_auto_select(&mut self) {
+        if self.selected_target.is_some() || self.no_video_chosen {
+            self.scan_rx = None;
+            return;
+        }
+        if let Some(rx) = &self.scan_rx {
+            match rx.try_recv() {
+                Ok(windows) => {
+                    self.scan_rx = None;
+                    self.windows = windows;
+                    if let Some(daw) = best_daw_window(&self.windows) {
+                        self.selected_target = Some((daw.hwnd, daw.pid));
+                        self.capturer.set_target(self.selected_target);
+                        self.mirror_texture = None;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.scan_rx = None,
+            }
+        } else if self.last_scan.elapsed() >= AUTO_SCAN_INTERVAL {
+            self.last_scan = Instant::now();
+            let (tx, rx) = mpsc::channel();
+            let spawned = std::thread::Builder::new()
+                .name("dawstream-winscan".into())
+                .spawn(move || {
+                    let _ = tx.send(list_windows());
+                });
+            if spawned.is_ok() {
+                self.scan_rx = Some(rx);
+            }
         }
     }
 
@@ -315,8 +363,11 @@ impl eframe::App for DawStreamApp {
             self.selected_target = None;
         } else if let Some(frame) = self.capturer.take_if_newer(self.last_frame_seq) {
             self.last_frame_seq = frame.seq;
-            let color_image =
-                egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.rgba);
+            // Zero-copy: the capture thread already produced egui-layout pixels.
+            let color_image = egui::ColorImage {
+                size: [frame.width, frame.height],
+                pixels: frame.pixels,
+            };
             match &mut self.mirror_texture {
                 Some(tex) => tex.set(color_image, egui::TextureOptions::LINEAR),
                 None => {
@@ -328,6 +379,8 @@ impl eframe::App for DawStreamApp {
                 }
             }
         }
+
+        self.poll_auto_select();
 
         let audio_status = self.audio_engine.status();
         self.smooth_peak_l = audio_status.peak_l.max(self.smooth_peak_l * 0.86);
@@ -398,6 +451,7 @@ impl eframe::App for DawStreamApp {
                                     .clicked()
                                 {
                                     self.selected_target = None;
+                                    self.no_video_chosen = true;
                                     self.capturer.set_target(None);
                                     self.mirror_texture = None;
                                 }
@@ -415,6 +469,7 @@ impl eframe::App for DawStreamApp {
                                         .clicked()
                                     {
                                         self.selected_target = Some((win.hwnd, win.pid));
+                                        self.no_video_chosen = false;
                                         self.capturer.set_target(self.selected_target);
                                         self.mirror_texture = None;
                                     }

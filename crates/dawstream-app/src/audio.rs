@@ -425,8 +425,14 @@ fn run_wasapi_session(
             format!("GetService<IAudioRenderClient>: {e}")
         })?;
 
-        // Target ~20 ms latency inside the IPC ring buffer
-        let target_latency_frames = (sample_rate as u64 * 20) / 1000;
+        // Minimum ~20 ms cushion inside the IPC ring buffer, grown to cover the DAW's block
+        // size: audio arrives in bursts of one host block (up to ~85 ms at 4096 frames), so a
+        // fixed 20 ms cushion underruns between bursts or trips the overrun reset.
+        let base_latency_frames = (sample_rate as u64 * 20) / 1000;
+        // WASAPI shared mode wakes us once per device period, about half the buffer.
+        let consumer_period = (buffer_frames as u64 / 2).max(1);
+        let mut target_latency_frames =
+            ring.effective_target_latency(base_latency_frames, consumer_period);
         ring.resync_consumer(target_latency_frames);
 
         // Pre-fill silence before starting
@@ -512,6 +518,10 @@ fn run_wasapi_session(
             } else if last_hb_time.elapsed() > Duration::from_millis(500) {
                 plugin_connected = false;
             }
+
+            // The active producer (or its block size) can change at any time.
+            target_latency_frames =
+                ring.effective_target_latency(base_latency_frames, consumer_period);
 
             let sample_count = (frames_available as usize) * 2;
             if temp_buf.len() < sample_count {
