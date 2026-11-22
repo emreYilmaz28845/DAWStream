@@ -108,6 +108,9 @@ pub struct SharedAudioRing {
     /// Consumer-local (not shared): `true` while waiting for the ring to refill
     /// to the target latency cushion after startup or an underrun.
     consumer_buffering: AtomicBool,
+    /// Consumer-local: set when an overrun reset jumped the read cursor (audio discontinuity),
+    /// so the consumer can de-click it. Cleared by `take_discontinuity()`.
+    consumer_discontinuity: AtomicBool,
 }
 
 unsafe impl Send for SharedAudioRing {}
@@ -190,6 +193,41 @@ fn sanitize_sample(x: f32) -> f32 {
         0.0
     }
 }
+
+/// Knee where `soft_clip` starts bending the signal.
+const SOFT_CLIP_KNEE: f32 = 0.9;
+
+/// Smooth limiter for boosted signals: identity up to the knee, then a tanh curve that
+/// approaches +/-1.0 with a continuous slope (no hard-clip distortion). Non-finite -> 0.
+#[inline]
+pub fn soft_clip(x: f32) -> f32 {
+    if !x.is_finite() {
+        return 0.0;
+    }
+    let a = x.abs();
+    if a <= SOFT_CLIP_KNEE {
+        return x;
+    }
+    let room = 1.0 - SOFT_CLIP_KNEE;
+    let y = SOFT_CLIP_KNEE + room * ((a - SOFT_CLIP_KNEE) / room).tanh();
+    y.min(1.0).copysign(x)
+}
+
+/// Gain-stage a sample: bit-transparent (hard-clamped only) at or below unity gain,
+/// soft-clipped when boosting so >0 dB gain doesn't hard-clip.
+#[inline]
+fn apply_gain(x: f32, gain: f32) -> f32 {
+    let y = x * gain;
+    if gain > 1.0 {
+        soft_clip(y)
+    } else {
+        sanitize_sample(y)
+    }
+}
+
+/// Peak-hold time for the shared meter value: readers poll every ~33 ms, so a peak must
+/// survive at least that long instead of being overwritten by the next tiny block.
+const PEAK_HOLD_SECONDS: f32 = 0.05;
 
 impl SharedAudioRing {
     /// Opens or creates the default named shared memory block.
@@ -332,6 +370,7 @@ impl SharedAudioRing {
                 handle,
                 view: block,
                 consumer_buffering: AtomicBool::new(true),
+                consumer_discontinuity: AtomicBool::new(false),
             })
         }
     }
@@ -386,6 +425,36 @@ impl SharedAudioRing {
     /// Producer: writes stereo planar slices into the interleaved ring buffer.
     /// Real-time safe (no locks, no allocations, NaN/Inf sanitized).
     pub fn write_planar(&self, left: &[f32], right: &[f32], gain: f32, muted: bool) {
+        let safe_gain = if gain.is_finite() {
+            gain.clamp(0.0, 4.0)
+        } else {
+            1.0
+        };
+        self.write_inner(left, right, |_| safe_gain, muted);
+    }
+
+    /// Producer: like `write_planar`, but with a per-sample gain (`gains[i]` for frame `i`),
+    /// so gain automation and mute fades are smooth instead of stepping once per block.
+    /// Frames beyond `gains.len()` use the last gain value.
+    pub fn write_planar_gains(&self, left: &[f32], right: &[f32], gains: &[f32], muted: bool) {
+        let last = gains.last().copied().unwrap_or(1.0);
+        self.write_inner(
+            left,
+            right,
+            |i| {
+                let g = gains.get(i).copied().unwrap_or(last);
+                if g.is_finite() {
+                    g.clamp(0.0, 4.0)
+                } else {
+                    1.0
+                }
+            },
+            muted,
+        );
+    }
+
+    #[inline]
+    fn write_inner(&self, left: &[f32], right: &[f32], gain_at: impl Fn(usize) -> f32, muted: bool) {
         let frames = left.len().min(right.len());
         if frames == 0 {
             return;
@@ -394,12 +463,6 @@ impl SharedAudioRing {
         let b = self.block();
         b.plugin_muted
             .store(if muted { 1 } else { 0 }, Ordering::Relaxed);
-
-        let safe_gain = if gain.is_finite() {
-            gain.clamp(0.0, 4.0)
-        } else {
-            1.0
-        };
 
         let now = now_tick_ms();
         let app_tick = b.app_last_tick_ms.load(Ordering::Acquire);
@@ -423,8 +486,9 @@ impl SharedAudioRing {
             }
         } else {
             for i in 0..frames {
-                let l = sanitize_sample(left[i] * safe_gain);
-                let r = sanitize_sample(right[i] * safe_gain);
+                let g = gain_at(i);
+                let l = apply_gain(left[i], g);
+                let r = apply_gain(right[i], g);
                 peak_l = peak_l.max(l.abs());
                 peak_r = peak_r.max(r.abs());
 
@@ -441,8 +505,19 @@ impl SharedAudioRing {
             }
         }
 
-        b.peak_l_bits.store(peak_l.to_bits(), Ordering::Relaxed);
-        b.peak_r_bits.store(peak_r.to_bits(), Ordering::Relaxed);
+        // Decaying peak hold: keep the loudest recent peak visible to ~30 Hz meter readers.
+        let sr = b
+            .sample_rate
+            .load(Ordering::Relaxed)
+            .clamp(MIN_SAMPLE_RATE, MAX_SAMPLE_RATE) as f32;
+        let decay = (-(frames as f32) / (sr * PEAK_HOLD_SECONDS)).exp();
+        let held = |bits: &AtomicU32, peak: f32| {
+            let prev = f32::from_bits(bits.load(Ordering::Relaxed));
+            let prev = if prev.is_finite() { prev } else { 0.0 };
+            bits.store(peak.max(prev * decay).to_bits(), Ordering::Relaxed);
+        };
+        held(&b.peak_l_bits, peak_l);
+        held(&b.peak_r_bits, peak_r);
         b.heartbeat.fetch_add(1, Ordering::Release);
     }
 
@@ -480,6 +555,7 @@ impl SharedAudioRing {
         if available > (RING_FRAMES as u64) || available > max_drift {
             rpos = wpos.saturating_sub(target_latency_frames + requested);
             available = wpos.wrapping_sub(rpos);
+            self.consumer_discontinuity.store(true, Ordering::Relaxed);
         }
 
         let mut buffering = self.consumer_buffering.load(Ordering::Relaxed);
@@ -518,6 +594,21 @@ impl SharedAudioRing {
         to_read
     }
 
+    /// Consumer: returns `true` once after an overrun reset jumped the read cursor.
+    #[inline]
+    pub fn take_discontinuity(&self) -> bool {
+        self.consumer_discontinuity.swap(false, Ordering::Relaxed)
+    }
+
+    /// Consumer: frames currently buffered between read and write cursors (ring-capped).
+    #[inline]
+    pub fn available_frames(&self) -> u64 {
+        let b = self.block();
+        let wpos = b.write_pos.load(Ordering::Acquire);
+        let rpos = b.read_pos.load(Ordering::Relaxed);
+        wpos.wrapping_sub(rpos).min(RING_FRAMES as u64)
+    }
+
     /// Resets consumer read cursor to just behind producer write cursor.
     pub fn resync_consumer(&self, target_latency_frames: u64) {
         let b = self.block();
@@ -554,6 +645,21 @@ impl SharedAudioRing {
         let b = self.block();
         b.app_last_tick_ms.store(now_tick_ms(), Ordering::Release);
         b.app_heartbeat.fetch_add(1, Ordering::Release);
+    }
+
+    /// Signals the companion app is running WITHOUT opening the privacy gate (no output
+    /// device yet, or reconnecting): the plugin UI can tell "app open" from "app closed".
+    #[inline]
+    pub fn bump_app_alive(&self) {
+        self.block().app_heartbeat.fetch_add(1, Ordering::Release);
+    }
+
+    /// `true` while the companion app is actively consuming audio (privacy gate open).
+    #[inline]
+    pub fn app_consuming(&self) -> bool {
+        let now = now_tick_ms();
+        let t = self.block().app_last_tick_ms.load(Ordering::Acquire);
+        t != 0 && t <= now && now - t <= CONSUMER_ACTIVE_TIMEOUT_MS
     }
 
     /// Producer: reads the companion app heartbeat counter.
@@ -853,6 +959,57 @@ mod tests {
         let mut out = vec![0.0f32; 960];
         ring.write_planar(&burst, &burst, 1.0, false);
         assert_eq!(ring.read_interleaved(&mut out, 960), 480);
+    }
+
+    #[test]
+    fn soft_clip_is_transparent_below_knee_and_bounded() {
+        assert_eq!(soft_clip(0.5), 0.5);
+        assert_eq!(soft_clip(-0.9), -0.9);
+        for x in [0.95f32, 1.0, 2.0, 10.0, -3.0] {
+            let y = soft_clip(x);
+            assert!(y.abs() <= 1.0 && y.abs() > 0.9);
+        }
+        assert_eq!(soft_clip(f32::NAN), 0.0);
+    }
+
+    #[test]
+    fn unity_gain_is_bit_transparent_and_boost_soft_clips() {
+        let name = unique_name("gainstage");
+        let ring = SharedAudioRing::open_or_create_named(&name).unwrap();
+        ring.bump_app_heartbeat();
+        ring.write_planar_gains(&[0.99, 0.7], &[-0.99, 0.7], &[1.0, 1.5], false);
+        let mut out = [0.0f32; 4];
+        assert_eq!(ring.read_interleaved(&mut out, 0), 2);
+        assert_eq!(out[0], 0.99);
+        assert_eq!(out[1], -0.99);
+        // 0.7 * 1.5 = 1.05 is bent below 1.0 instead of being hard-clipped to 1.0.
+        assert!(out[2] > 0.95 && out[2] < 1.0, "{}", out[2]);
+    }
+
+    #[test]
+    fn peaks_are_held_across_small_blocks() {
+        let name = unique_name("peakhold");
+        let ring = SharedAudioRing::open_or_create_named(&name).unwrap();
+        ring.write_planar(&[0.8; 32], &[0.8; 32], 1.0, false);
+        for _ in 0..10 {
+            ring.write_planar(&[0.0; 32], &[0.0; 32], 1.0, false);
+        }
+        // 352 frames (~7 ms at 48 kHz) later the transient must still be visible.
+        assert!(ring.peaks().0 > 0.6);
+    }
+
+    #[test]
+    fn overrun_sets_discontinuity_flag() {
+        let name = unique_name("discont");
+        let ring = SharedAudioRing::open_or_create_named(&name).unwrap();
+        ring.bump_app_heartbeat();
+        ring.resync_consumer(960);
+        let burst = vec![0.5f32; 4096];
+        ring.write_planar(&burst, &burst, 1.0, false);
+        let mut out = vec![0.0f32; 960];
+        ring.read_interleaved(&mut out, 960);
+        assert!(ring.take_discontinuity());
+        assert!(!ring.take_discontinuity());
     }
 
     #[test]

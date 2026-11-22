@@ -4,7 +4,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use dawstream_ipc::{SharedAudioRing, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE};
-use windows::core::{PCWSTR, PWSTR};
+use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{CloseHandle, S_FALSE, S_OK, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
@@ -22,7 +22,12 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
     COINIT_MULTITHREADED, STGM_READ,
 };
-use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows::Win32::System::Threading::{
+    AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CreateEventW,
+    WaitForSingleObject,
+};
+
+use crate::dsp::StreamConditioner;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DeviceTier {
@@ -93,6 +98,48 @@ unsafe fn pwstr_to_string_and_free(pwstr: PWSTR) -> String {
     let s = pwstr.to_string().unwrap_or_default();
     CoTaskMemFree(Some(pwstr.0 as *const _));
     s
+}
+
+/// Registers the current thread with MMCSS ("Pro Audio") for the guard's lifetime, so the
+/// WASAPI feeder keeps its deadline while a game, the DAW and Discord compete for CPU.
+struct MmcssGuard(Option<windows::Win32::Foundation::HANDLE>);
+
+impl MmcssGuard {
+    fn pro_audio() -> Self {
+        let mut task_index = 0u32;
+        let handle = unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task_index) }.ok();
+        Self(handle)
+    }
+}
+
+impl Drop for MmcssGuard {
+    fn drop(&mut self) {
+        if let Some(h) = self.0.take() {
+            unsafe {
+                let _ = AvRevertMmThreadCharacteristics(h);
+            }
+        }
+    }
+}
+
+/// Sleeps ~`ms` in 100 ms slices while telling the plugin the app is open (without opening
+/// the audio privacy gate). Returns early when `running` clears or `wake` is set.
+fn idle_alive(ring: Option<&SharedAudioRing>, ms: u64, running: &AtomicBool, wake: Option<&AtomicBool>) {
+    let mut left = ms;
+    loop {
+        if let Some(r) = ring {
+            r.bump_app_alive();
+        }
+        if left == 0
+            || !running.load(Ordering::Acquire)
+            || wake.map(|w| w.load(Ordering::Acquire)).unwrap_or(false)
+        {
+            return;
+        }
+        let step = left.min(100);
+        thread::sleep(Duration::from_millis(step));
+        left -= step;
+    }
 }
 
 /// Balanced RAII guard for COM initialization: only calls `CoUninitialize`
@@ -274,6 +321,7 @@ fn audio_thread_main(
     status: Arc<Mutex<AudioStatus>>,
 ) {
     let _com = ComGuard::init_mta();
+    let _mmcss = MmcssGuard::pro_audio();
 
     let ring = loop {
         if !running.load(Ordering::Acquire) {
@@ -304,7 +352,7 @@ fn audio_thread_main(
                 s.active_device_name = "No output selected".into();
                 s.last_error = None;
             }
-            thread::sleep(Duration::from_millis(100));
+            idle_alive(Some(&ring), 100, &running, Some(&device_changed));
             continue;
         };
 
@@ -322,13 +370,8 @@ fn audio_thread_main(
             if let Ok(mut s) = status.lock() {
                 s.last_error = Some(e);
             }
-            // Brief backoff before retrying
-            for _ in 0..10 {
-                if !running.load(Ordering::Acquire) || device_changed.load(Ordering::Acquire) {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
+            // Brief backoff before retrying (the plugin still sees the app as open)
+            idle_alive(Some(&ring), 1_000, &running, Some(&device_changed));
         }
     }
 }
@@ -457,7 +500,14 @@ fn run_wasapi_session(
         let mut last_hb = ring.heartbeat();
         let mut last_hb_time = Instant::now();
         let mut plugin_connected = false;
-        let mut temp_buf: Vec<f32> = Vec::new();
+        // Preallocated for the largest possible request: no allocation in the render loop.
+        let mut temp_buf: Vec<f32> = vec![0.0; buffer_frames as usize * 2];
+        let initial_gain = if app_muted.load(Ordering::Relaxed) {
+            0.0
+        } else {
+            f32::from_bits(volume_bits.load(Ordering::Relaxed))
+        };
+        let mut conditioner = StreamConditioner::new(sample_rate, buffer_frames as usize, initial_gain);
         let mut status_tick = Instant::now();
 
         while running.load(Ordering::Acquire) && !device_changed.load(Ordering::Acquire) {
@@ -523,29 +573,22 @@ fn run_wasapi_session(
             target_latency_frames =
                 ring.effective_target_latency(base_latency_frames, consumer_period);
 
-            let sample_count = (frames_available as usize) * 2;
-            if temp_buf.len() < sample_count {
-                temp_buf.resize(sample_count, 0.0);
-            }
+            let sample_count = ((frames_available as usize) * 2).min(temp_buf.len());
+            let frames_available = (sample_count / 2) as u32;
             let slice = &mut temp_buf[..sample_count];
 
             let muted = app_muted.load(Ordering::Relaxed);
             let vol = f32::from_bits(volume_bits.load(Ordering::Relaxed));
 
-            if plugin_connected && !muted {
-                ring.read_interleaved(slice, target_latency_frames);
-                if (vol - 1.0).abs() > 1e-4 {
-                    for s in slice.iter_mut() {
-                        *s = (*s * vol).clamp(-1.0, 1.0);
-                    }
-                }
-            } else {
-                // Keep reading/advancing ring if connected & muted, otherwise output silence
-                if plugin_connected {
-                    ring.read_interleaved(slice, target_latency_frames);
-                }
-                slice.fill(0.0);
-            }
+            // Drift-compensated, de-clicked read with smoothed volume/mute. While muted the
+            // ring keeps draining (gain ramps to 0) so it never overflows.
+            conditioner.render(
+                ring,
+                slice,
+                target_latency_frames,
+                plugin_connected,
+                if muted { 0.0 } else { vol },
+            );
 
             match render_client.GetBuffer(frames_available) {
                 Ok(ptr) if !ptr.is_null() => {

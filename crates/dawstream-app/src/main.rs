@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio;
+mod dsp;
 mod capture;
 mod config;
 mod window_list;
@@ -16,6 +17,8 @@ use window_list::{best_daw_window, list_windows, WindowInfo};
 
 /// How often to look for a DAW window while nothing is being captured.
 const AUTO_SCAN_INTERVAL: Duration = Duration::from_secs(2);
+/// How often to re-enumerate audio outputs while the preferred one is missing or failing.
+const DEVICE_SCAN_INTERVAL: Duration = Duration::from_secs(3);
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, SetLastError, BOOL, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE,
@@ -168,7 +171,13 @@ struct DawStreamApp {
     last_scan: Instant,
 
     devices: Vec<AudioOutputDevice>,
+    /// Output currently driven by the audio engine.
     selected_device_id: Option<String>,
+    /// Output the user chose (persisted). Kept when that device is temporarily unplugged,
+    /// so a fallback never overwrites the saved choice; switched back when it returns.
+    preferred_device_id: Option<String>,
+    device_rx: Option<mpsc::Receiver<Vec<AudioOutputDevice>>>,
+    last_device_scan: Instant,
 
     audio_engine: AudioEngine,
     capturer: WindowCapturer,
@@ -197,6 +206,7 @@ impl DawStreamApp {
         let selected_target = best_daw_window(&windows).map(|w| (w.hwnd, w.pid));
 
         let devices = list_output_devices();
+        let preferred_device_id = saved.device_id.clone();
         let selected_device_id = saved
             .device_id
             .filter(|id| devices.iter().any(|d| &d.id == id))
@@ -220,6 +230,9 @@ impl DawStreamApp {
             last_scan: Instant::now(),
             devices,
             selected_device_id,
+            preferred_device_id,
+            device_rx: None,
+            last_device_scan: Instant::now(),
             audio_engine,
             capturer,
             mirror_texture: None,
@@ -240,7 +253,10 @@ impl DawStreamApp {
             .ok()
             .and_then(|p| p.to_str().map(|s| s.to_string()));
         AppConfig {
-            device_id: self.selected_device_id.clone(),
+            device_id: self
+                .preferred_device_id
+                .clone()
+                .or_else(|| self.selected_device_id.clone()),
             volume: self.volume,
             muted: self.muted,
             app_exe_path: exe_path,
@@ -303,12 +319,56 @@ impl DawStreamApp {
     }
 
     fn refresh_devices(&mut self) {
-        self.devices = list_output_devices();
-        if let Some(ref id) = self.selected_device_id {
-            if !self.devices.iter().any(|d| &d.id == id) {
-                self.selected_device_id = self.devices.first().map(|d| d.id.clone());
-                self.audio_engine.set_device(self.selected_device_id.clone());
-                self.save_config();
+        let devices = list_output_devices();
+        self.apply_devices(devices);
+    }
+
+    /// Applies a fresh device list: return to the preferred output when it is present,
+    /// otherwise fall back (without touching the saved preference) if the active one vanished.
+    fn apply_devices(&mut self, devices: Vec<AudioOutputDevice>) {
+        self.devices = devices;
+        let has = |id: &String| self.devices.iter().any(|d| &d.id == id);
+        let next = match (&self.preferred_device_id, &self.selected_device_id) {
+            (Some(pref), _) if has(pref) => Some(pref.clone()),
+            (_, Some(cur)) if has(cur) => Some(cur.clone()),
+            _ => self.devices.first().map(|d| d.id.clone()),
+        };
+        if next != self.selected_device_id {
+            self.selected_device_id = next;
+            self.audio_engine.set_device(self.selected_device_id.clone());
+        }
+    }
+
+    /// While running on a fallback output or the output is failing (unplugged interface,
+    /// driver restart), re-enumerate in the background so recovery needs no manual Refresh.
+    fn poll_devices(&mut self, audio_error: bool) {
+        let degraded = audio_error
+            || self.selected_device_id.is_none()
+            || (self.preferred_device_id.is_some()
+                && self.preferred_device_id != self.selected_device_id);
+        if !degraded {
+            self.device_rx = None;
+            return;
+        }
+        if let Some(rx) = &self.device_rx {
+            match rx.try_recv() {
+                Ok(devices) => {
+                    self.device_rx = None;
+                    self.apply_devices(devices);
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.device_rx = None,
+            }
+        } else if self.last_device_scan.elapsed() >= DEVICE_SCAN_INTERVAL {
+            self.last_device_scan = Instant::now();
+            let (tx, rx) = mpsc::channel();
+            let spawned = std::thread::Builder::new()
+                .name("dawstream-devscan".into())
+                .spawn(move || {
+                    let _ = tx.send(list_output_devices());
+                });
+            if spawned.is_ok() {
+                self.device_rx = Some(rx);
             }
         }
     }
@@ -383,6 +443,12 @@ impl eframe::App for DawStreamApp {
         self.poll_auto_select();
 
         let audio_status = self.audio_engine.status();
+        self.poll_devices(audio_status.last_error.is_some());
+        let capture_msg = if self.selected_target.is_some() {
+            self.capturer.state().message()
+        } else {
+            None
+        };
         self.smooth_peak_l = audio_status.peak_l.max(self.smooth_peak_l * 0.86);
         self.smooth_peak_r = audio_status.peak_r.max(self.smooth_peak_r * 0.86);
 
@@ -513,6 +579,7 @@ impl eframe::App for DawStreamApp {
                                         .clicked()
                                     {
                                         self.selected_device_id = Some(dev.id.clone());
+                                        self.preferred_device_id = Some(dev.id.clone());
                                         self.audio_engine.set_device(Some(dev.id.clone()));
                                         self.save_config();
                                     }
@@ -589,6 +656,9 @@ impl eframe::App for DawStreamApp {
                             if fps > 0.1 {
                                 ui.weak(format!("{fps:.0} FPS"));
                             }
+                            if let Some(msg) = capture_msg {
+                                ui.colored_label(egui::Color32::from_rgb(245, 190, 65), msg);
+                            }
                         });
                     });
 
@@ -605,6 +675,13 @@ impl eframe::App for DawStreamApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(egui::Color32::from_rgb(12, 13, 16)))
             .show(ctx, |ui| {
+                // Capture no larger than what is shown (physical pixels): the capturer
+                // downscales with HALFTONE instead of the GPU aliasing a huge texture.
+                let ppp = ctx.pixels_per_point();
+                let panel = ui.available_size() * ppp;
+                self.capturer
+                    .set_max_output(panel.x.max(1.0) as u32, panel.y.max(1.0) as u32);
+
                 if let Some(tex) = &self.mirror_texture {
                     let avail = ui.available_size();
                     let tex_size = tex.size_vec2();
@@ -619,6 +696,10 @@ impl eframe::App for DawStreamApp {
                         ui.vertical_centered(|ui| {
                             ui.add_space(40.0);
                             ui.heading("DAWStream Ready");
+                            if let Some(msg) = capture_msg {
+                                ui.add_space(8.0);
+                                ui.colored_label(egui::Color32::from_rgb(245, 190, 65), msg);
+                            }
                             ui.add_space(12.0);
                             ui.label("1. Open your DAW (FL Studio, Ableton Live, Cubase, REAPER, Studio One, Bitwig, etc.) and add DAWStream (VST3/CLAP) to your Master channel.");
                             ui.label("2. Select your DAW window above and choose a [Recommended] silent audio output.");

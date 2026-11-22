@@ -1,11 +1,11 @@
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dawstream_ipc::SharedAudioRing;
+use dawstream_ipc::{SharedAudioRing, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE};
 use nih_plug::prelude::*;
 use nih_plug_egui::{create_egui_editor, egui, EguiState};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
@@ -22,6 +22,8 @@ use windows_sys::core::GUID;
 
 const DRIVE_REMOTE: u32 = 4;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+/// Mute / unmute fade length on the stream (removes the click of a hard switch).
+const MUTE_FADE_SECONDS: f32 = 0.005;
 
 pub struct DawStreamPlugin {
     params: Arc<DawStreamParams>,
@@ -31,6 +33,15 @@ pub struct DawStreamPlugin {
     sample_rate: u32,
     /// Largest block seen since `initialize()`; published so the app can size its cushion.
     max_block: u32,
+    /// Per-sample smoothed gain scratch (allocated in `initialize()`, never in `process()`).
+    gain_buf: Vec<f32>,
+    /// Mute fade envelope (1 = audible, 0 = muted) and its per-sample step.
+    mute_env: f32,
+    mute_step: f32,
+    /// Offline (export/bounce) processing: runs faster than real time, so never stream it.
+    offline: bool,
+    /// Host sample rate shared with the editor (to flag rates the stream can't carry).
+    host_rate: Arc<AtomicU32>,
 }
 
 impl Drop for DawStreamPlugin {
@@ -92,6 +103,11 @@ impl Default for DawStreamPlugin {
             instance_id: Arc::new(AtomicU64::new(id)),
             sample_rate: 48_000,
             max_block: 0,
+            gain_buf: Vec::new(),
+            mute_env: 1.0,
+            mute_step: 1.0 / (MUTE_FADE_SECONDS * 48_000.0),
+            offline: false,
+            host_rate: Arc::new(AtomicU32::new(48_000)),
         }
     }
 }
@@ -99,6 +115,7 @@ impl Default for DawStreamPlugin {
 struct EditorUiState {
     ring: Option<Arc<SharedAudioRing>>,
     instance_id: Arc<AtomicU64>,
+    host_rate: Arc<AtomicU32>,
     last_app_hb: u64,
     last_app_hb_time: Option<Instant>,
     app_connected: bool,
@@ -351,6 +368,7 @@ impl Plugin for DawStreamPlugin {
         let ui_state = EditorUiState {
             ring,
             instance_id: self.instance_id.clone(),
+            host_rate: self.host_rate.clone(),
             last_app_hb: initial_hb,
             last_app_hb_time: None,
             app_connected: false,
@@ -372,6 +390,15 @@ impl Plugin for DawStreamPlugin {
             },
             move |egui_ctx, setter, state| {
                 let my_id = state.instance_id.load(Ordering::Acquire);
+                let host_rate = state.host_rate.load(Ordering::Relaxed);
+                let rate_supported = (MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&host_rate);
+                // App open but not consuming (no output device / reconnecting): the audio
+                // privacy gate is closed, so don't claim the stream is LIVE.
+                let app_consuming = state
+                    .ring
+                    .as_ref()
+                    .map(|r| r.app_consuming())
+                    .unwrap_or(false);
                 let (peak_l, peak_r, sr, is_owner) = if let Some(ring) = &state.ring {
                     let hb = ring.app_heartbeat();
                     if hb != state.last_app_hb {
@@ -425,10 +452,20 @@ impl Plugin for DawStreamPlugin {
                     .show(egui_ctx, |ui| {
                         // Row 1: Status dot + sample rate | Open App / Take Over button
                         ui.horizontal(|ui| {
-                            let (dot_color, status_text) = if !is_owner {
+                            let (dot_color, status_text) = if !rate_supported {
+                                (
+                                    egui::Color32::from_rgb(240, 100, 100),
+                                    format!("Unsupported rate ({host_rate} Hz)"),
+                                )
+                            } else if !is_owner {
                                 (
                                     egui::Color32::from_rgb(240, 190, 60),
                                     "Standby (Another instance active)".to_string(),
+                                )
+                            } else if state.app_connected && !app_consuming {
+                                (
+                                    egui::Color32::from_rgb(240, 190, 60),
+                                    "App open: no output device".to_string(),
                                 )
                             } else if state.app_connected {
                                 (
@@ -563,11 +600,19 @@ impl Plugin for DawStreamPlugin {
             self.ring = SharedAudioRing::open_or_create().ok().map(Arc::new);
         }
         self.sample_rate = buffer_config.sample_rate.round() as u32;
+        self.host_rate.store(self.sample_rate, Ordering::Relaxed);
+        self.offline = buffer_config.process_mode == ProcessMode::Offline;
         // Buffer size may have changed (initialize() re-runs on device/buffer changes).
         self.max_block = 0;
+        // Non-RT context: size the per-sample gain scratch for the host's largest block.
+        let max_block = (buffer_config.max_buffer_size as usize).clamp(64, 1 << 16);
+        self.gain_buf.clear();
+        self.gain_buf.resize(max_block, 1.0);
+        self.mute_step = 1.0 / (MUTE_FADE_SECONDS * buffer_config.sample_rate.max(1.0));
+        self.mute_env = if self.params.mute_stream.value() { 0.0 } else { 1.0 };
         if let Some(ring) = &self.ring {
             let id = ensure_instance_id(ring, &self.instance_id);
-            if ring.is_or_claim_owner(id) {
+            if ring.is_or_claim_owner(id) && self.rate_supported() {
                 ring.set_sample_rate(self.sample_rate);
             }
         }
@@ -593,6 +638,16 @@ impl Plugin for DawStreamPlugin {
         if !ring.is_or_claim_owner(id) {
             return ProcessStatus::KeepAlive;
         }
+        // Exports/bounces run faster than real time; streaming them only produces garbled
+        // overrun fragments. The lease above stays refreshed so ownership doesn't move.
+        if self.offline {
+            return ProcessStatus::KeepAlive;
+        }
+        // The app can't carry this rate (e.g. 352.8/384 kHz): publishing a clamped rate would
+        // play the stream at the wrong pitch, so stay silent and let the editor say why.
+        if !self.rate_supported() {
+            return ProcessStatus::KeepAlive;
+        }
         // Always publish OUR rate: ownership may have moved here via Take Over / lease expiry
         if ring.sample_rate() != self.sample_rate {
             ring.set_sample_rate(self.sample_rate);
@@ -606,17 +661,57 @@ impl Plugin for DawStreamPlugin {
         self.max_block = self.max_block.max(num_samples as u32);
         ring.set_producer_block_frames(self.max_block);
 
-        let gain = self.params.stream_gain.smoothed.next_step(num_samples as u32);
         let muted = self.params.mute_stream.value();
-
+        let mute_target = if muted { 0.0 } else { 1.0 };
         let slices = buffer.as_slice_immutable();
-        if slices.len() >= 2 {
-            ring.write_planar(slices[0], slices[1], gain, muted);
-        } else if slices.len() == 1 {
-            ring.write_planar(slices[0], slices[0], gain, muted);
+        let (left, right): (&[f32], &[f32]) = match slices.len() {
+            0 => return ProcessStatus::KeepAlive,
+            1 => (&*slices[0], &*slices[0]),
+            _ => (&*slices[0], &*slices[1]),
+        };
+
+        if self.gain_buf.is_empty() {
+            // initialize() not run (should not happen): block-constant fallback.
+            let gain = self.params.stream_gain.smoothed.next_step(num_samples as u32);
+            ring.write_planar(left, right, gain, muted);
+            return ProcessStatus::KeepAlive;
+        }
+
+        // Per-sample gain smoothing and a short mute fade, in chunks of the scratch size.
+        let chunk = self.gain_buf.len();
+        let mut start = 0;
+        while start < num_samples {
+            let len = chunk.min(num_samples - start);
+            let (l, r) = (&left[start..start + len], &right[start..start + len]);
+            if muted && self.mute_env <= 0.0 {
+                // Fully faded out: keep the smoother advancing, write explicit silence.
+                self.params.stream_gain.smoothed.next_step(len as u32);
+                ring.write_planar(l, r, 1.0, true);
+            } else {
+                let gains = &mut self.gain_buf[..len];
+                self.params.stream_gain.smoothed.next_block(gains, len);
+                for g in gains.iter_mut() {
+                    if self.mute_env != mute_target {
+                        self.mute_env = if mute_target > self.mute_env {
+                            (self.mute_env + self.mute_step).min(1.0)
+                        } else {
+                            (self.mute_env - self.mute_step).max(0.0)
+                        };
+                    }
+                    *g *= self.mute_env;
+                }
+                ring.write_planar_gains(l, r, gains, false);
+            }
+            start += len;
         }
 
         ProcessStatus::KeepAlive
+    }
+}
+
+impl DawStreamPlugin {
+    fn rate_supported(&self) -> bool {
+        (MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&self.sample_rate)
     }
 }
 
