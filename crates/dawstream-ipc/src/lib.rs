@@ -27,10 +27,10 @@ use windows_sys::Win32::System::Memory::{
 };
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 
-pub const SHARED_MEM_NAME: &str = "Local\\DAWStream_AudioRing_v4";
+pub const SHARED_MEM_NAME: &str = "Local\\DAWStream_AudioRing_v5";
 pub const MAGIC: u32 = 0x4441_5753; // "DAWS"
 const MAGIC_INITING: u32 = 0x494E_4954; // "INIT"
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
 // Mandatory-label constants (winnt.h)
 const SYSTEM_MANDATORY_LABEL_ACE_TYPE: u8 = 0x11;
@@ -58,6 +58,42 @@ pub const CHANNELS: usize = 2;
 /// Upper bound accepted for `producer_block_frames` (keeps the cushion well inside the ring).
 pub const MAX_PRODUCER_BLOCK: u64 = 8_192;
 
+/// Producer-written hot atomics on their own 64-byte cache line to avoid false sharing
+/// with the consumer (WASAPI thread).
+#[repr(C, align(64))]
+pub struct ProducerHot {
+    /// Monotonically increasing count of stereo frames written by producer.
+    pub write_pos: AtomicU64,
+    /// Incremented by the active plugin on every `process()` call.
+    pub heartbeat: AtomicU64,
+    /// Peak levels encoded as `f32::to_bits()` for UI metering.
+    pub peak_l_bits: AtomicU32,
+    pub peak_r_bits: AtomicU32,
+    /// 0 = active, 1 = muted by plugin.
+    pub plugin_muted: AtomicU32,
+    /// Largest `process()` block (frames) the active producer has delivered. The consumer
+    /// sizes its latency cushion from it, because audio arrives in bursts of one DAW block.
+    /// 0 = unknown (older plugin build).
+    pub producer_block_frames: AtomicU32,
+}
+
+/// Consumer-written hot atomics on their own 64-byte cache line.
+#[repr(C, align(64))]
+pub struct ConsumerHot {
+    /// Monotonically increasing count of stereo frames read by consumer.
+    pub read_pos: AtomicU64,
+    /// Incremented by the companion app while actively reading audio.
+    pub app_heartbeat: AtomicU64,
+    /// Monotonic tick (`GetTickCount64`) when the companion app was last active.
+    pub app_last_tick_ms: AtomicU64,
+}
+
+/// Ring sample buffer aligned to a 64-byte cache line boundary.
+#[repr(C, align(64))]
+pub struct SampleRing {
+    pub data: [AtomicU32; RING_FRAMES * CHANNELS],
+}
+
 /// Memory layout shared between the plugin (producer) and companion app (consumer).
 /// All fields are atomic to avoid any data races / UB across processes.
 #[repr(C, align(64))]
@@ -67,38 +103,17 @@ pub struct SharedAudioBlock {
     pub sample_rate: AtomicU32,
     pub channels: AtomicU32,
 
-    /// Monotonically increasing count of stereo frames written by producer.
-    pub write_pos: AtomicU64,
-    /// Monotonically increasing count of stereo frames read by consumer.
-    pub read_pos: AtomicU64,
-
-    /// Incremented by the active plugin on every `process()` call.
-    pub heartbeat: AtomicU64,
-
-    /// Peak levels encoded as `f32::to_bits()` for UI metering.
-    pub peak_l_bits: AtomicU32,
-    pub peak_r_bits: AtomicU32,
-
-    /// 0 = active, 1 = muted by plugin.
-    pub plugin_muted: AtomicU32,
-    /// Largest `process()` block (frames) the active producer has delivered. The consumer
-    /// sizes its latency cushion from it, because audio arrives in bursts of one DAW block.
-    /// 0 = unknown (older plugin build).
-    pub producer_block_frames: AtomicU32,
-
-    /// Incremented by the companion app while actively reading audio.
-    pub app_heartbeat: AtomicU64,
-    /// Monotonic tick (`GetTickCount64`) when the companion app was last active.
-    pub app_last_tick_ms: AtomicU64,
-
     /// Multi-instance guard, packed so owner + lease timestamp change in ONE atomic op:
     /// high 32 bits = owner instance id (0 = none), low 32 bits = `GetTickCount64() as u32`
     /// of the owner's last `process()` call.
     pub owner_lease: AtomicU64,
     pub next_instance_id: AtomicU64,
 
+    pub producer: ProducerHot,
+    pub consumer: ConsumerHot,
+
     /// Interleaved stereo f32 samples stored as atomic bit patterns: `[L0, R0, L1, R1, ...]`.
-    pub samples: [AtomicU32; RING_FRAMES * CHANNELS],
+    pub samples: SampleRing,
 }
 
 /// Safe RAII wrapper around the Windows shared memory mapping.
@@ -213,16 +228,31 @@ pub fn soft_clip(x: f32) -> f32 {
     y.min(1.0).copysign(x)
 }
 
+/// Width of the crossfade from bit-transparent hard clamp to `soft_clip` as gain rises
+/// above unity (avoids a step discontinuity on hot signals when automating across 0 dB).
+const SOFT_CLIP_BLEND_END: f32 = 1.05;
+
 /// Gain-stage a sample: bit-transparent (hard-clamped only) at or below unity gain,
-/// soft-clipped when boosting so >0 dB gain doesn't hard-clip.
+/// smoothly crossfaded into `soft_clip` between 1.0 and 1.05 so >0 dB boost doesn't
+/// hard-clip or step when crossing unity.
 #[inline]
-fn apply_gain(x: f32, gain: f32) -> f32 {
+pub fn apply_gain_staged(x: f32, gain: f32) -> f32 {
     let y = x * gain;
-    if gain > 1.0 {
+    if gain <= 1.0 {
+        sanitize_sample(y)
+    } else if gain >= SOFT_CLIP_BLEND_END {
         soft_clip(y)
     } else {
-        sanitize_sample(y)
+        let t = (gain - 1.0) / (SOFT_CLIP_BLEND_END - 1.0);
+        let dry = sanitize_sample(y);
+        let wet = soft_clip(y);
+        dry + (wet - dry) * t
     }
+}
+
+#[inline]
+fn apply_gain(x: f32, gain: f32) -> f32 {
+    apply_gain_staged(x, gain)
 }
 
 /// Peak-hold time for the shared meter value: readers poll every ~33 ms, so a peak must
@@ -336,17 +366,23 @@ impl SharedAudioRing {
                 block_ref.version.store(VERSION, Ordering::Release);
                 block_ref.sample_rate.store(48_000, Ordering::Release);
                 block_ref.channels.store(CHANNELS as u32, Ordering::Release);
-                block_ref.write_pos.store(0, Ordering::Release);
-                block_ref.read_pos.store(0, Ordering::Release);
-                block_ref.heartbeat.store(0, Ordering::Release);
-                block_ref.peak_l_bits.store(0, Ordering::Release);
-                block_ref.peak_r_bits.store(0, Ordering::Release);
-                block_ref.plugin_muted.store(0, Ordering::Release);
-                block_ref.producer_block_frames.store(0, Ordering::Release);
-                block_ref.app_heartbeat.store(0, Ordering::Release);
-                block_ref.app_last_tick_ms.store(0, Ordering::Release);
                 block_ref.owner_lease.store(0, Ordering::Release);
                 block_ref.next_instance_id.store(1, Ordering::Release);
+                block_ref.producer.write_pos.store(0, Ordering::Release);
+                block_ref.producer.heartbeat.store(0, Ordering::Release);
+                block_ref.producer.peak_l_bits.store(0, Ordering::Release);
+                block_ref.producer.peak_r_bits.store(0, Ordering::Release);
+                block_ref.producer.plugin_muted.store(0, Ordering::Release);
+                block_ref
+                    .producer
+                    .producer_block_frames
+                    .store(0, Ordering::Release);
+                block_ref.consumer.read_pos.store(0, Ordering::Release);
+                block_ref.consumer.app_heartbeat.store(0, Ordering::Release);
+                block_ref
+                    .consumer
+                    .app_last_tick_ms
+                    .store(0, Ordering::Release);
                 block_ref.magic.store(MAGIC, Ordering::Release);
             } else {
                 // Spin briefly if another process is mid-initialization
@@ -402,15 +438,18 @@ impl SharedAudioRing {
     #[inline]
     pub fn set_producer_block_frames(&self, frames: u32) {
         let b = self.block();
-        if b.producer_block_frames.load(Ordering::Relaxed) != frames {
-            b.producer_block_frames.store(frames, Ordering::Relaxed);
+        if b.producer.producer_block_frames.load(Ordering::Relaxed) != frames {
+            b.producer
+                .producer_block_frames
+                .store(frames, Ordering::Relaxed);
         }
     }
 
     /// Consumer: largest producer block size in frames (0 if unknown), capped to a sane bound.
     #[inline]
     pub fn producer_block_frames(&self) -> u64 {
-        (self.block().producer_block_frames.load(Ordering::Relaxed) as u64).min(MAX_PRODUCER_BLOCK)
+        (self.block().producer.producer_block_frames.load(Ordering::Relaxed) as u64)
+            .min(MAX_PRODUCER_BLOCK)
     }
 
     /// Consumer: latency cushion (frames) that survives one producer burst plus one consumer
@@ -461,15 +500,16 @@ impl SharedAudioRing {
         }
 
         let b = self.block();
-        b.plugin_muted
+        b.producer
+            .plugin_muted
             .store(if muted { 1 } else { 0 }, Ordering::Relaxed);
 
         let now = now_tick_ms();
-        let app_tick = b.app_last_tick_ms.load(Ordering::Acquire);
+        let app_tick = b.consumer.app_last_tick_ms.load(Ordering::Acquire);
         let consumer_active =
             app_tick != 0 && app_tick <= now && now.saturating_sub(app_tick) <= CONSUMER_ACTIVE_TIMEOUT_MS;
 
-        let start_wpos = b.write_pos.load(Ordering::Acquire);
+        let start_wpos = b.producer.write_pos.load(Ordering::Acquire);
         let mut wpos = start_wpos;
         let mut peak_l = 0.0f32;
         let mut peak_r = 0.0f32;
@@ -478,8 +518,8 @@ impl SharedAudioRing {
             if consumer_active {
                 for _ in 0..frames {
                     let idx = (wpos as usize & RING_MASK) * 2;
-                    b.samples[idx].store(0, Ordering::Relaxed);
-                    b.samples[idx + 1].store(0, Ordering::Relaxed);
+                    b.samples.data[idx].store(0, Ordering::Relaxed);
+                    b.samples.data[idx + 1].store(0, Ordering::Relaxed);
                     wpos = wpos.wrapping_add(1);
                 }
                 Self::commit_write_pos(b, start_wpos, wpos);
@@ -495,8 +535,8 @@ impl SharedAudioRing {
                 // Privacy gate: only write audio samples into shared memory when DAWStream.exe is active
                 if consumer_active {
                     let idx = (wpos as usize & RING_MASK) * 2;
-                    b.samples[idx].store(l.to_bits(), Ordering::Relaxed);
-                    b.samples[idx + 1].store(r.to_bits(), Ordering::Relaxed);
+                    b.samples.data[idx].store(l.to_bits(), Ordering::Relaxed);
+                    b.samples.data[idx + 1].store(r.to_bits(), Ordering::Relaxed);
                     wpos = wpos.wrapping_add(1);
                 }
             }
@@ -516,9 +556,9 @@ impl SharedAudioRing {
             let prev = if prev.is_finite() { prev } else { 0.0 };
             bits.store(peak.max(prev * decay).to_bits(), Ordering::Relaxed);
         };
-        held(&b.peak_l_bits, peak_l);
-        held(&b.peak_r_bits, peak_r);
-        b.heartbeat.fetch_add(1, Ordering::Release);
+        held(&b.producer.peak_l_bits, peak_l);
+        held(&b.producer.peak_r_bits, peak_r);
+        b.producer.heartbeat.fetch_add(1, Ordering::Release);
     }
 
     /// Publishes a new write cursor only if no other producer advanced it meanwhile
@@ -526,6 +566,7 @@ impl SharedAudioRing {
     #[inline]
     fn commit_write_pos(b: &SharedAudioBlock, start: u64, end: u64) {
         let _ = b
+            .producer
             .write_pos
             .compare_exchange(start, end, Ordering::AcqRel, Ordering::Relaxed);
     }
@@ -543,8 +584,8 @@ impl SharedAudioRing {
         let requested = requested_frames as u64;
 
         let b = self.block();
-        let wpos = b.write_pos.load(Ordering::Acquire);
-        let mut rpos = b.read_pos.load(Ordering::Relaxed);
+        let wpos = b.producer.write_pos.load(Ordering::Acquire);
+        let mut rpos = b.consumer.read_pos.load(Ordering::Relaxed);
 
         let max_drift = (target_latency_frames * 3).max(requested * 4);
         let mut available = wpos.wrapping_sub(rpos);
@@ -569,7 +610,7 @@ impl SharedAudioRing {
             } else {
                 self.consumer_buffering.store(true, Ordering::Relaxed);
                 out[..requested_frames * 2].fill(0.0);
-                b.read_pos.store(rpos, Ordering::Release);
+                b.consumer.read_pos.store(rpos, Ordering::Release);
                 return 0;
             }
         }
@@ -579,8 +620,8 @@ impl SharedAudioRing {
 
         for i in 0..to_read {
             let idx = (rpos as usize & RING_MASK) * 2;
-            let l = f32::from_bits(b.samples[idx].load(Ordering::Relaxed));
-            let r = f32::from_bits(b.samples[idx + 1].load(Ordering::Relaxed));
+            let l = f32::from_bits(b.samples.data[idx].load(Ordering::Relaxed));
+            let r = f32::from_bits(b.samples.data[idx + 1].load(Ordering::Relaxed));
             out[i * 2] = sanitize_sample(l);
             out[i * 2 + 1] = sanitize_sample(r);
             rpos = rpos.wrapping_add(1);
@@ -590,7 +631,7 @@ impl SharedAudioRing {
             out[to_read * 2..requested_frames * 2].fill(0.0);
         }
 
-        b.read_pos.store(rpos, Ordering::Release);
+        b.consumer.read_pos.store(rpos, Ordering::Release);
         to_read
     }
 
@@ -604,30 +645,31 @@ impl SharedAudioRing {
     #[inline]
     pub fn available_frames(&self) -> u64 {
         let b = self.block();
-        let wpos = b.write_pos.load(Ordering::Acquire);
-        let rpos = b.read_pos.load(Ordering::Relaxed);
+        let wpos = b.producer.write_pos.load(Ordering::Acquire);
+        let rpos = b.consumer.read_pos.load(Ordering::Relaxed);
         wpos.wrapping_sub(rpos).min(RING_FRAMES as u64)
     }
 
-    /// Resets consumer read cursor to just behind producer write cursor.
-    pub fn resync_consumer(&self, target_latency_frames: u64) {
+    /// Resets consumer read cursor to the current producer write cursor and enters buffering,
+    /// so stale or old-sample-rate audio is never replayed after a device or rate change.
+    pub fn resync_consumer(&self, _target_latency_frames: u64) {
         let b = self.block();
-        let wpos = b.write_pos.load(Ordering::Acquire);
-        b.read_pos
-            .store(wpos.saturating_sub(target_latency_frames), Ordering::Release);
+        let wpos = b.producer.write_pos.load(Ordering::Acquire);
+        b.consumer.read_pos.store(wpos, Ordering::Release);
         self.consumer_buffering.store(true, Ordering::Relaxed);
+        self.consumer_discontinuity.store(false, Ordering::Relaxed);
     }
 
     #[inline]
     pub fn heartbeat(&self) -> u64 {
-        self.block().heartbeat.load(Ordering::Acquire)
+        self.block().producer.heartbeat.load(Ordering::Acquire)
     }
 
     #[inline]
     pub fn peaks(&self) -> (f32, f32) {
         let b = self.block();
-        let l = f32::from_bits(b.peak_l_bits.load(Ordering::Relaxed));
-        let r = f32::from_bits(b.peak_r_bits.load(Ordering::Relaxed));
+        let l = f32::from_bits(b.producer.peak_l_bits.load(Ordering::Relaxed));
+        let r = f32::from_bits(b.producer.peak_r_bits.load(Ordering::Relaxed));
         (
             if l.is_finite() { l.clamp(0.0, 1.0) } else { 0.0 },
             if r.is_finite() { r.clamp(0.0, 1.0) } else { 0.0 },
@@ -636,36 +678,41 @@ impl SharedAudioRing {
 
     #[inline]
     pub fn plugin_muted(&self) -> bool {
-        self.block().plugin_muted.load(Ordering::Relaxed) != 0
+        self.block().producer.plugin_muted.load(Ordering::Relaxed) != 0
     }
 
     /// Consumer: signals that the companion app is alive and reading.
     #[inline]
     pub fn bump_app_heartbeat(&self) {
         let b = self.block();
-        b.app_last_tick_ms.store(now_tick_ms(), Ordering::Release);
-        b.app_heartbeat.fetch_add(1, Ordering::Release);
+        b.consumer
+            .app_last_tick_ms
+            .store(now_tick_ms(), Ordering::Release);
+        b.consumer.app_heartbeat.fetch_add(1, Ordering::Release);
     }
 
     /// Signals the companion app is running WITHOUT opening the privacy gate (no output
     /// device yet, or reconnecting): the plugin UI can tell "app open" from "app closed".
     #[inline]
     pub fn bump_app_alive(&self) {
-        self.block().app_heartbeat.fetch_add(1, Ordering::Release);
+        self.block()
+            .consumer
+            .app_heartbeat
+            .fetch_add(1, Ordering::Release);
     }
 
     /// `true` while the companion app is actively consuming audio (privacy gate open).
     #[inline]
     pub fn app_consuming(&self) -> bool {
         let now = now_tick_ms();
-        let t = self.block().app_last_tick_ms.load(Ordering::Acquire);
+        let t = self.block().consumer.app_last_tick_ms.load(Ordering::Acquire);
         t != 0 && t <= now && now - t <= CONSUMER_ACTIVE_TIMEOUT_MS
     }
 
     /// Producer: reads the companion app heartbeat counter.
     #[inline]
     pub fn app_heartbeat(&self) -> u64 {
-        self.block().app_heartbeat.load(Ordering::Acquire)
+        self.block().consumer.app_heartbeat.load(Ordering::Acquire)
     }
 
     /// Allocates a unique non-zero producer instance ID (fits in 32 bits).
@@ -1052,5 +1099,47 @@ mod tests {
         assert!(!squat.is_null());
         assert!(SharedAudioRing::open_or_create_named(&name).is_err());
         unsafe { CloseHandle(squat) };
+    }
+
+    #[test]
+    fn resync_consumer_skips_stale_audio() {
+        let name = unique_name("resync_stale");
+        let ring = SharedAudioRing::open_or_create_named(&name).unwrap();
+        ring.bump_app_heartbeat();
+
+        // Write stale audio at an old rate, then resync as on sample-rate change.
+        ring.write_planar(&[0.9; 16], &[0.9; 16], 1.0, false);
+        ring.resync_consumer(4);
+        assert_eq!(ring.available_frames(), 0);
+
+        // Fresh audio arrives; only fresh samples (0.25) should be read.
+        ring.write_planar(&[0.25; 8], &[0.25; 8], 1.0, false);
+        let mut out = [0.0f32; 8]; // 4 frames
+        assert_eq!(ring.read_interleaved(&mut out, 4), 4);
+        for s in out {
+            assert!((s - 0.25).abs() < 1e-6, "stale sample leaked: {s}");
+        }
+    }
+
+    #[test]
+    fn apply_gain_staged_smooth_across_unity() {
+        let x = 0.98f32;
+        let at_unity = apply_gain_staged(x, 1.0);
+        let just_above = apply_gain_staged(x, 1.001);
+        assert_eq!(at_unity, x);
+        // No step discontinuity when crossing 1.0
+        assert!(
+            (just_above - at_unity).abs() < 0.002,
+            "step across unity: {at_unity} -> {just_above}"
+        );
+    }
+
+    #[test]
+    fn hot_atomics_on_separate_cache_lines() {
+        let prod_off = std::mem::offset_of!(SharedAudioBlock, producer);
+        let cons_off = std::mem::offset_of!(SharedAudioBlock, consumer);
+        let samp_off = std::mem::offset_of!(SharedAudioBlock, samples);
+        assert!(cons_off - prod_off >= 64);
+        assert!(samp_off - cons_off >= 64);
     }
 }

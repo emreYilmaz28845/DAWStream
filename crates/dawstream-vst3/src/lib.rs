@@ -72,7 +72,7 @@ struct DawStreamParams {
 impl Default for DawStreamParams {
     fn default() -> Self {
         Self {
-            editor_state: EguiState::from_size(360, 118),
+            editor_state: EguiState::from_size(360, 146),
 
             stream_gain: FloatParam::new(
                 "Stream Gain",
@@ -354,10 +354,10 @@ impl Plugin for DawStreamPlugin {
         // NOTE: never mutate the process environment here — this DLL runs inside a
         // multi-threaded host. (The plugin editor uses baseview's own WGL, not glutin.)
         let params = self.params.clone();
-        let ring = self
-            .ring
-            .clone()
-            .or_else(|| SharedAudioRing::open_or_create().ok().map(Arc::new));
+        if self.ring.is_none() {
+            self.ring = SharedAudioRing::open_or_create().ok().map(Arc::new);
+        }
+        let ring = self.ring.clone();
 
         if let Some(ref r) = ring {
             ensure_instance_id(r, &self.instance_id);
@@ -399,7 +399,7 @@ impl Plugin for DawStreamPlugin {
                     .as_ref()
                     .map(|r| r.app_consuming())
                     .unwrap_or(false);
-                let (peak_l, peak_r, sr, is_owner) = if let Some(ring) = &state.ring {
+                let (peak_l, peak_r, sr, is_owner, processing) = if let Some(ring) = &state.ring {
                     let hb = ring.app_heartbeat();
                     if hb != state.last_app_hb {
                         state.last_app_hb = hb;
@@ -420,7 +420,7 @@ impl Plugin for DawStreamPlugin {
                         state.last_plugin_hb_time = Instant::now();
                     }
                     let processing =
-                        state.last_plugin_hb_time.elapsed() < Duration::from_millis(150);
+                        state.last_plugin_hb_time.elapsed() < Duration::from_millis(250);
 
                     let owner = ring.active_owner_id();
                     let is_owner = owner == 0 || (my_id != 0 && owner == my_id);
@@ -429,13 +429,15 @@ impl Plugin for DawStreamPlugin {
                     } else {
                         (0.0, 0.0)
                     };
-                    (l, r, ring.sample_rate(), is_owner)
+                    (l, r, ring.sample_rate(), is_owner, processing)
                 } else {
-                    (0.0, 0.0, 48_000, true)
+                    (0.0, 0.0, 48_000, true, false)
                 };
 
-                state.smooth_l = peak_l.max(state.smooth_l * 0.86);
-                state.smooth_r = peak_r.max(state.smooth_r * 0.86);
+                let dt = egui_ctx.input(|i| i.unstable_dt).clamp(0.0, 0.1);
+                let decay = (-dt / 0.12).exp();
+                state.smooth_l = peak_l.max(state.smooth_l * decay);
+                state.smooth_r = peak_r.max(state.smooth_r * decay);
 
                 if let Some((_, ts)) = &state.launch_error {
                     if ts.elapsed() > Duration::from_secs(4) {
@@ -466,6 +468,11 @@ impl Plugin for DawStreamPlugin {
                                 (
                                     egui::Color32::from_rgb(240, 190, 60),
                                     "App open: no output device".to_string(),
+                                )
+                            } else if state.app_connected && !processing {
+                                (
+                                    egui::Color32::from_rgb(240, 190, 60),
+                                    "Bypassed / Idle".to_string(),
                                 )
                             } else if state.app_connected {
                                 (
@@ -559,16 +566,24 @@ impl Plugin for DawStreamPlugin {
 
                             let current_gain = params.stream_gain.value();
                             let mut db = util::gain_to_db(current_gain).clamp(-60.0, 12.0);
-                            if ui
-                                .add(
-                                    egui::Slider::new(&mut db, -60.0..=12.0)
-                                        .suffix(" dB")
-                                        .fixed_decimals(1),
-                                )
-                                .changed()
-                            {
+                            let slider_resp = ui.add(
+                                egui::Slider::new(&mut db, -60.0..=12.0)
+                                    .suffix(" dB")
+                                    .fixed_decimals(1),
+                            );
+                            if slider_resp.drag_started() {
                                 setter.begin_set_parameter(&params.stream_gain);
-                                setter.set_parameter(&params.stream_gain, util::db_to_gain(db));
+                            }
+                            if slider_resp.changed() {
+                                if !slider_resp.dragged() && !slider_resp.drag_started() {
+                                    setter.begin_set_parameter(&params.stream_gain);
+                                    setter.set_parameter(&params.stream_gain, util::db_to_gain(db));
+                                    setter.end_set_parameter(&params.stream_gain);
+                                } else {
+                                    setter.set_parameter(&params.stream_gain, util::db_to_gain(db));
+                                }
+                            }
+                            if slider_resp.drag_stopped() {
                                 setter.end_set_parameter(&params.stream_gain);
                             }
 

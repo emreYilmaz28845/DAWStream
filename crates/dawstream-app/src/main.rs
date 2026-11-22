@@ -219,7 +219,7 @@ impl DawStreamApp {
         audio_engine.set_volume(volume);
         audio_engine.set_muted(muted);
 
-        let capturer = WindowCapturer::start(60);
+        let capturer = WindowCapturer::start(60, cc.egui_ctx.clone());
         capturer.set_target(selected_target);
 
         let app = Self {
@@ -412,7 +412,9 @@ impl DawStreamApp {
 
 impl eframe::App for DawStreamApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if ctx.input(|i| i.key_pressed(egui::Key::H)) {
+        if !ctx.wants_keyboard_input()
+            && ctx.input(|i| i.modifiers.is_none() && i.key_pressed(egui::Key::H))
+        {
             self.hide_toolbar = !self.hide_toolbar;
         }
 
@@ -449,8 +451,10 @@ impl eframe::App for DawStreamApp {
         } else {
             None
         };
-        self.smooth_peak_l = audio_status.peak_l.max(self.smooth_peak_l * 0.86);
-        self.smooth_peak_r = audio_status.peak_r.max(self.smooth_peak_r * 0.86);
+        let dt = ctx.input(|i| i.unstable_dt).clamp(0.0, 0.1);
+        let decay = (-dt / 0.12).exp();
+        self.smooth_peak_l = audio_status.peak_l.max(self.smooth_peak_l * decay);
+        self.smooth_peak_r = audio_status.peak_r.max(self.smooth_peak_r * decay);
 
         let selected_device_tier = self
             .devices
@@ -578,9 +582,12 @@ impl eframe::App for DawStreamApp {
                                         )
                                         .clicked()
                                     {
+                                        let changed = self.selected_device_id.as_ref() != Some(&dev.id);
                                         self.selected_device_id = Some(dev.id.clone());
                                         self.preferred_device_id = Some(dev.id.clone());
-                                        self.audio_engine.set_device(Some(dev.id.clone()));
+                                        if changed || audio_status.last_error.is_some() {
+                                            self.audio_engine.set_device(Some(dev.id.clone()));
+                                        }
                                         self.save_config();
                                     }
                                 }
@@ -643,23 +650,24 @@ impl eframe::App for DawStreamApp {
                             self.save_config();
                         }
 
-                        // Right-aligned FPS & Hide bar button
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .button("Hide Bar (H)")
-                                .on_hover_text("Hide top bar for a clean Discord stream (press H to restore)")
-                                .clicked()
-                            {
-                                self.hide_toolbar = true;
-                            }
-                            let fps = self.capturer.fps();
-                            if fps > 0.1 {
-                                ui.weak(format!("{fps:.0} FPS"));
-                            }
-                            if let Some(msg) = capture_msg {
-                                ui.colored_label(egui::Color32::from_rgb(245, 190, 65), msg);
-                            }
-                        });
+                        ui.separator();
+
+                        // Capture status, FPS & Hide bar button (kept in horizontal_wrapped
+                        // flow so narrow windows wrap cleanly instead of clipping on the right)
+                        if let Some(msg) = capture_msg {
+                            ui.colored_label(egui::Color32::from_rgb(245, 190, 65), msg);
+                        }
+                        let fps = self.capturer.fps();
+                        if fps > 0.1 {
+                            ui.weak(format!("{fps:.0} FPS"));
+                        }
+                        if ui
+                            .button("Hide Bar (H)")
+                            .on_hover_text("Hide top bar for a clean Discord stream (press H to restore)")
+                            .clicked()
+                        {
+                            self.hide_toolbar = true;
+                        }
                     });
 
                     if let Some(err) = &audio_status.last_error {
@@ -711,7 +719,7 @@ impl eframe::App for DawStreamApp {
                 }
             });
 
-        // Floating "Show Bar" pill when toolbar is hidden and mouse hovers near top edge
+        // Floating "Show Bar" pill + capture warning when toolbar is hidden
         if self.hide_toolbar {
             let near_top = ctx
                 .input(|i| i.pointer.hover_pos())
@@ -726,13 +734,26 @@ impl eframe::App for DawStreamApp {
                         }
                     });
             }
+            if let Some(msg) = capture_msg {
+                if self.mirror_texture.is_some() {
+                    egui::Area::new(egui::Id::new("capture_warning_overlay"))
+                        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -12.0))
+                        .show(ctx, |ui| {
+                            egui::Frame::none()
+                                .fill(egui::Color32::from_rgba_unmultiplied(20, 22, 28, 220))
+                                .rounding(6.0)
+                                .inner_margin(egui::Margin::symmetric(10.0, 5.0))
+                                .show(ui, |ui| {
+                                    ui.colored_label(egui::Color32::from_rgb(245, 190, 65), msg);
+                                });
+                        });
+                }
+            }
         }
 
-        if self.selected_target.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(16));
-        } else {
-            ctx.request_repaint_after(Duration::from_millis(66));
-        }
+        // Video frames wake the UI directly via egui_ctx.request_repaint() from capture_loop;
+        // keep a lightweight ~30 Hz fallback timer for VU meters and status updates.
+        ctx.request_repaint_after(Duration::from_millis(33));
     }
 }
 

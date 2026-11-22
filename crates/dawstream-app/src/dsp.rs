@@ -10,7 +10,7 @@
 //!
 //! Real-time safe after construction: no allocations in `render`.
 
-use dawstream_ipc::{soft_clip, SharedAudioRing};
+use dawstream_ipc::{apply_gain_staged, SharedAudioRing};
 
 /// Maximum deviation from the nominal rate (±0.2 % ≈ ±3.5 cents, inaudible).
 const MAX_RATIO_DEVIATION: f64 = 0.002;
@@ -130,10 +130,17 @@ impl StreamConditioner {
                         self.in_buf[i * 2] *= g;
                         self.in_buf[i * 2 + 1] *= g;
                     }
+                } else if jumped {
+                    // Overrun reset skipped audio: seed resampler history with the first
+                    // post-jump frame so Catmull-Rom does not ring across the jump and
+                    // out[0] equals the exact post-jump sample for the de-clicker.
+                    let first = [self.in_buf[0], self.in_buf[1]];
+                    self.hist = [first; 3];
+                    self.frac = 0.0;
                 }
                 self.resample(m, &mut out[..n * 2]);
                 if jumped && !started {
-                    // Overrun reset skipped audio: remove the step at the chunk boundary.
+                    // Remove the step between the previous output and the first post-jump sample.
                     self.declick[0] += self.last_y[0] - out[0];
                     self.declick[1] += self.last_y[1] - out[1];
                 }
@@ -148,7 +155,6 @@ impl StreamConditioner {
         }
 
         // De-click, then smoothed gain + gain staging.
-        let boosting = gain_target > 1.0 || self.gain > 1.0;
         for f in 0..n {
             for c in 0..2 {
                 let y = out[f * 2 + c] + self.declick[c];
@@ -160,8 +166,7 @@ impl StreamConditioner {
             }
             self.gain += (gain_target - self.gain) * self.gain_coef;
             for c in 0..2 {
-                let v = out[f * 2 + c] * self.gain;
-                out[f * 2 + c] = if boosting { soft_clip(v) } else { v.clamp(-1.0, 1.0) };
+                out[f * 2 + c] = apply_gain_staged(out[f * 2 + c], self.gain);
             }
         }
     }
@@ -335,5 +340,37 @@ mod tests {
         // First frames still near full level, decaying monotonically toward 0.
         assert!(out[2 * 4] > 0.4);
         assert!(out[2 * 255] < out[2 * 4]);
+    }
+
+    #[test]
+    fn overrun_declick_removes_boundary_step() {
+        let ring = ring("overrun_declick");
+        ring.bump_app_heartbeat();
+        let target = 64u64;
+        ring.resync_consumer(target);
+
+        let mut cond = StreamConditioner::new(48_000, 64, 1.0);
+        // Prime steady playback at +0.8.
+        ring.write_planar(&[0.8; 128], &[0.8; 128], 1.0, false);
+        let mut out = vec![0.0f32; 64]; // 32 frames
+        cond.playing = true;
+        cond.render(&ring, &mut out, target, true, 1.0);
+        let prev_end = out[out.len() - 2];
+        assert!((prev_end - 0.8).abs() < 1e-4);
+
+        // Trigger an overrun jump into -0.8 (1.6-amplitude step).
+        ring.write_planar(&[-0.8; 512], &[-0.8; 512], 1.0, false);
+        cond.render(&ring, &mut out, target, true, 1.0);
+
+        // First sample must stay continuous with prev_end, and no huge step should appear.
+        assert!(
+            (out[0] - prev_end).abs() < 0.05,
+            "boundary step: {prev_end} -> {}",
+            out[0]
+        );
+        for f in 1..32 {
+            let delta = (out[f * 2] - out[(f - 1) * 2]).abs();
+            assert!(delta < 0.05, "click at frame {f}: delta={delta}");
+        }
     }
 }

@@ -1,17 +1,21 @@
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use eframe::egui::Color32;
-use windows::Win32::Foundation::{HWND, RECT};
+use eframe::egui::{self, Color32};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GdiFlush, GetDC, ReleaseDC,
     SelectObject, SetBrushOrgEx, SetStretchBltMode, StretchBlt, BITMAPINFO, BITMAPINFOHEADER,
     BI_RGB, DIB_RGB_COLORS, HALFTONE, HBITMAP, HDC, HGDIOBJ, SRCCOPY,
 };
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
+use windows::Win32::System::Threading::{
+    CreateWaitableTimerExW, SetWaitableTimer, WaitForSingleObject,
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetWindowDisplayAffinity, GetWindowRect, GetWindowThreadProcessId, IsIconic,
     IsWindow, WDA_EXCLUDEFROMCAPTURE, WDA_MONITOR,
@@ -73,8 +77,8 @@ pub struct CapturedFrame {
 }
 
 pub struct WindowCapturer {
-    target_hwnd: Arc<AtomicIsize>,
-    target_pid: Arc<AtomicU32>,
+    target: Arc<Mutex<Option<(isize, u32)>>>,
+    target_active: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     latest_frame: Arc<Mutex<Option<CapturedFrame>>>,
     fps_x10: Arc<AtomicU64>,
@@ -85,9 +89,9 @@ pub struct WindowCapturer {
 }
 
 impl WindowCapturer {
-    pub fn start(target_fps: u32) -> Self {
-        let target_hwnd = Arc::new(AtomicIsize::new(0));
-        let target_pid = Arc::new(AtomicU32::new(0));
+    pub fn start(target_fps: u32, egui_ctx: egui::Context) -> Self {
+        let target = Arc::new(Mutex::new(None));
+        let target_active = Arc::new(AtomicBool::new(false));
         let running = Arc::new(AtomicBool::new(true));
         let latest_frame = Arc::new(Mutex::new(None));
         let fps_x10 = Arc::new(AtomicU64::new(0));
@@ -95,13 +99,14 @@ impl WindowCapturer {
         let state = Arc::new(AtomicU32::new(CaptureState::Idle as u32));
 
         let shared = Shared {
-            target_hwnd: target_hwnd.clone(),
-            target_pid: target_pid.clone(),
+            target: target.clone(),
+            target_active: target_active.clone(),
             running: running.clone(),
             latest_frame: latest_frame.clone(),
             fps_x10: fps_x10.clone(),
             max_output: max_output.clone(),
             state: state.clone(),
+            egui_ctx,
         };
 
         let frame_interval = Duration::from_secs_f64(1.0 / target_fps.max(1) as f64);
@@ -112,8 +117,8 @@ impl WindowCapturer {
             .expect("failed to spawn capture thread");
 
         Self {
-            target_hwnd,
-            target_pid,
+            target,
+            target_active,
             running,
             latest_frame,
             fps_x10,
@@ -125,25 +130,19 @@ impl WindowCapturer {
 
     /// Sets the target `(hwnd, pid)`. Storing the PID prevents capturing an unrelated
     /// window if Windows recycles the HWND after the DAW closes.
-    pub fn set_target(&self, target: Option<(isize, u32)>) {
-        match target {
-            Some((hwnd, pid)) => {
-                self.target_pid.store(pid, Ordering::Release);
-                self.target_hwnd.store(hwnd, Ordering::Release);
-            }
-            None => {
-                self.target_hwnd.store(0, Ordering::Release);
-                self.target_pid.store(0, Ordering::Release);
-                if let Ok(mut guard) = self.latest_frame.lock() {
-                    *guard = None;
-                }
-            }
+    pub fn set_target(&self, new_target: Option<(isize, u32)>) {
+        if let Ok(mut guard) = self.target.lock() {
+            *guard = new_target;
+        }
+        self.target_active.store(new_target.is_some(), Ordering::Release);
+        if let Ok(mut guard) = self.latest_frame.lock() {
+            *guard = None;
         }
     }
 
     /// Largest frame size (physical pixels) worth capturing: the on-screen mirror size.
-    /// Frames are downscaled (HALFTONE) to fit, which avoids aliasing from GPU
-    /// minification and cuts per-frame conversion/upload cost.
+    /// Frames much larger than the display (or larger than the GPU texture limit) are
+    /// downscaled on CPU; mild scaling is left to GPU bilinear filtering.
     pub fn set_max_output(&self, width: u32, height: u32) {
         let packed = ((width as u64) << 32) | height as u64;
         self.max_output.store(packed, Ordering::Relaxed);
@@ -160,7 +159,7 @@ impl WindowCapturer {
     }
 
     pub fn has_active_target(&self) -> bool {
-        self.target_hwnd.load(Ordering::Acquire) != 0
+        self.target_active.load(Ordering::Acquire)
     }
 
     pub fn fps(&self) -> f32 {
@@ -182,13 +181,14 @@ impl Drop for WindowCapturer {
 }
 
 struct Shared {
-    target_hwnd: Arc<AtomicIsize>,
-    target_pid: Arc<AtomicU32>,
+    target: Arc<Mutex<Option<(isize, u32)>>>,
+    target_active: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     latest_frame: Arc<Mutex<Option<CapturedFrame>>>,
     fps_x10: Arc<AtomicU64>,
     max_output: Arc<AtomicU64>,
     state: Arc<AtomicU32>,
+    egui_ctx: egui::Context,
 }
 
 impl Shared {
@@ -196,13 +196,31 @@ impl Shared {
         self.state.store(s as u32, Ordering::Relaxed);
     }
 
-    fn clear_target(&self) {
-        self.target_hwnd.store(0, Ordering::Release);
-        self.target_pid.store(0, Ordering::Release);
-        self.fps_x10.store(0, Ordering::Relaxed);
-        self.set_state(CaptureState::Idle);
-        if let Ok(mut guard) = self.latest_frame.lock() {
-            *guard = None;
+    fn current_target(&self) -> Option<(isize, u32)> {
+        self.target.lock().ok().and_then(|g| *g)
+    }
+
+    /// Clears the target ONLY if it still matches `(stale_hwnd, stale_pid)`, so a
+    /// stale capture iteration never clobbers a newer window picked by the user.
+    fn clear_target_if(&self, stale_hwnd: isize, stale_pid: u32) {
+        let cleared = if let Ok(mut guard) = self.target.lock() {
+            if *guard == Some((stale_hwnd, stale_pid)) {
+                *guard = None;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if cleared {
+            self.target_active.store(false, Ordering::Release);
+            self.fps_x10.store(0, Ordering::Relaxed);
+            self.set_state(CaptureState::Idle);
+            if let Ok(mut guard) = self.latest_frame.lock() {
+                *guard = None;
+            }
+            self.egui_ctx.request_repaint();
         }
     }
 }
@@ -314,14 +332,23 @@ impl Dib {
 }
 
 /// Output size for a `w x h` source fitted (aspect-preserving, downscale only) into
-/// `max_w x max_h` and the GPU texture limit.
+/// `max_w x max_h` and the GPU texture limit. Mild downscales (<= 1.5x of the panel)
+/// are skipped so the GPU handles them with hardware bilinear filtering instead of
+/// running software GDI `StretchBlt(HALFTONE)` on every frame.
 fn fit_output(w: i32, h: i32, max_w: u32, max_h: u32) -> (i32, i32) {
-    let (max_w, max_h) = (
+    let over_tex_limit = w > MAX_OUTPUT_DIM as i32 || h > MAX_OUTPUT_DIM as i32;
+    let needs_cpu_downscale = over_tex_limit
+        || (max_w > 0 && (w as u64) * 2 > (max_w as u64) * 3)
+        || (max_h > 0 && (h as u64) * 2 > (max_h as u64) * 3);
+    if !needs_cpu_downscale {
+        return (w, h);
+    }
+    let (cap_w, cap_h) = (
         if max_w == 0 { MAX_OUTPUT_DIM } else { max_w.min(MAX_OUTPUT_DIM) },
         if max_h == 0 { MAX_OUTPUT_DIM } else { max_h.min(MAX_OUTPUT_DIM) },
     );
-    let scale = (max_w as f64 / w as f64)
-        .min(max_h as f64 / h as f64)
+    let scale = (cap_w as f64 / w as f64)
+        .min(cap_h as f64 / h as f64)
         .min(1.0);
     if scale >= 1.0 {
         return (w, h);
@@ -332,12 +359,59 @@ fn fit_output(w: i32, h: i32, max_w: u32, max_h: u32) -> (i32, i32) {
     )
 }
 
+/// High-resolution waitable timer (~0.5 ms accuracy instead of Windows' default 15.6 ms
+/// `thread::sleep` tick), falling back to `thread::sleep` on older Windows builds.
+struct HighResTimer(Option<HANDLE>);
+
+impl HighResTimer {
+    fn new() -> Self {
+        let handle = unsafe {
+            CreateWaitableTimerExW(
+                None,
+                None,
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_ALL_ACCESS.0,
+            )
+            .ok()
+        };
+        Self(handle)
+    }
+
+    fn sleep(&self, dur: Duration) {
+        if dur.is_zero() {
+            return;
+        }
+        if let Some(h) = self.0 {
+            // Negative value = relative time in 100-nanosecond intervals.
+            let due_100ns = -((dur.as_nanos() / 100).max(1) as i64);
+            unsafe {
+                if SetWaitableTimer(h, &due_100ns, 0, None, None, false).is_ok() {
+                    let _ = WaitForSingleObject(h, 1_000);
+                    return;
+                }
+            }
+        }
+        thread::sleep(dur);
+    }
+}
+
+impl Drop for HighResTimer {
+    fn drop(&mut self) {
+        if let Some(h) = self.0.take() {
+            unsafe {
+                let _ = CloseHandle(h);
+            }
+        }
+    }
+}
+
 fn capture_loop(shared: Shared, frame_interval: Duration) {
     let mut seq: u64 = 0;
     let mut frames_this_sec: u32 = 0;
     let mut fps_timer = Instant::now();
     let mut src = Dib::empty();
     let mut scaled = Dib::empty();
+    let timer = HighResTimer::new();
 
     while shared.running.load(Ordering::Acquire) {
         let loop_start = Instant::now();
@@ -351,13 +425,22 @@ fn capture_loop(shared: Shared, frame_interval: Duration) {
             fps_timer = Instant::now();
         }
 
-        let raw_hwnd = shared.target_hwnd.load(Ordering::Acquire);
-        let expected_pid = shared.target_pid.load(Ordering::Acquire);
-
-        if raw_hwnd == 0 {
+        let Some((raw_hwnd, expected_pid)) = shared.current_target() else {
             shared.fps_x10.store(0, Ordering::Relaxed);
             shared.set_state(CaptureState::Idle);
-            thread::sleep(Duration::from_millis(50));
+            timer.sleep(Duration::from_millis(50));
+            continue;
+        };
+
+        // Backpressure: if the UI hasn't consumed the previous frame yet (e.g. minimized
+        // or slower than 60 FPS), skip capturing/allocating another multi-MB frame.
+        if shared
+            .latest_frame
+            .lock()
+            .map(|g| g.is_some())
+            .unwrap_or(false)
+        {
+            timer.sleep(Duration::from_millis(8));
             continue;
         }
 
@@ -374,13 +457,13 @@ fn capture_loop(shared: Shared, frame_interval: Duration) {
         unsafe {
             // Guard against Windows HWND recycling leaking an unrelated private window
             if !IsWindow(hwnd).as_bool() || !pid_matches() {
-                shared.clear_target();
-                thread::sleep(Duration::from_millis(50));
+                shared.clear_target_if(raw_hwnd, expected_pid);
+                timer.sleep(Duration::from_millis(50));
                 continue;
             }
             if IsIconic(hwnd).as_bool() {
                 shared.set_state(CaptureState::Minimized);
-                thread::sleep(Duration::from_millis(50));
+                timer.sleep(Duration::from_millis(50));
                 continue;
             }
 
@@ -390,7 +473,7 @@ fn capture_loop(shared: Shared, frame_interval: Duration) {
                 && (affinity == WDA_EXCLUDEFROMCAPTURE.0 || affinity == WDA_MONITOR.0)
             {
                 shared.set_state(CaptureState::Protected);
-                thread::sleep(Duration::from_millis(50));
+                timer.sleep(Duration::from_millis(50));
                 continue;
             }
 
@@ -403,7 +486,7 @@ fn capture_loop(shared: Shared, frame_interval: Duration) {
             if !got_client || width <= 0 || height <= 0 {
                 if GetWindowRect(hwnd, &mut rect).is_err() {
                     shared.set_state(CaptureState::Failed);
-                    thread::sleep(Duration::from_millis(50));
+                    timer.sleep(Duration::from_millis(50));
                     continue;
                 }
                 width = rect.right.checked_sub(rect.left).unwrap_or(0);
@@ -413,7 +496,7 @@ fn capture_loop(shared: Shared, frame_interval: Duration) {
 
             if width <= 0 || height <= 0 {
                 shared.set_state(CaptureState::Failed);
-                thread::sleep(Duration::from_millis(50));
+                timer.sleep(Duration::from_millis(50));
                 continue;
             }
             if width > MAX_CAPTURE_DIM
@@ -421,19 +504,19 @@ fn capture_loop(shared: Shared, frame_interval: Duration) {
                 || (width as i64) * (height as i64) > MAX_CAPTURE_PIXELS
             {
                 shared.set_state(CaptureState::TooLarge);
-                thread::sleep(Duration::from_millis(200));
+                timer.sleep(Duration::from_millis(200));
                 continue;
             }
 
             if !src.ensure(width, height) {
                 shared.set_state(CaptureState::Failed);
-                thread::sleep(Duration::from_millis(100));
+                timer.sleep(Duration::from_millis(100));
                 continue;
             }
 
             // Re-verify owning PID immediately before PrintWindow to minimize HWND-recycling TOCTOU
             if !pid_matches() {
-                shared.clear_target();
+                shared.clear_target_if(raw_hwnd, expected_pid);
                 continue;
             }
 
@@ -445,7 +528,7 @@ fn capture_loop(shared: Shared, frame_interval: Duration) {
                 let frame = if (out_w, out_h) == (width, height) {
                     Some((width, height, src.to_pixels()))
                 } else if scaled.ensure(out_w, out_h) {
-                    // HALFTONE averages source pixels: clean downscale of small DAW text.
+                    // HALFTONE averages source pixels: clean downscale when >> panel size.
                     SetStretchBltMode(scaled.dc, HALFTONE);
                     let _ = SetBrushOrgEx(scaled.dc, 0, 0, None);
                     let ok = StretchBlt(
@@ -460,17 +543,21 @@ fn capture_loop(shared: Shared, frame_interval: Duration) {
 
                 match frame {
                     Some((w, h, pixels)) => {
-                        seq += 1;
-                        if let Ok(mut guard) = shared.latest_frame.lock() {
-                            *guard = Some(CapturedFrame {
-                                width: w as usize,
-                                height: h as usize,
-                                pixels,
-                                seq,
-                            });
+                        // Drop the frame if the user switched/cleared targets while PrintWindow ran.
+                        if shared.current_target() == Some((raw_hwnd, expected_pid)) {
+                            seq += 1;
+                            if let Ok(mut guard) = shared.latest_frame.lock() {
+                                *guard = Some(CapturedFrame {
+                                    width: w as usize,
+                                    height: h as usize,
+                                    pixels,
+                                    seq,
+                                });
+                            }
+                            frames_this_sec += 1;
+                            shared.set_state(CaptureState::Live);
+                            shared.egui_ctx.request_repaint();
                         }
-                        frames_this_sec += 1;
-                        shared.set_state(CaptureState::Live);
                     }
                     None => shared.set_state(CaptureState::Failed),
                 }
@@ -481,7 +568,7 @@ fn capture_loop(shared: Shared, frame_interval: Duration) {
 
         let spent = loop_start.elapsed();
         if spent < frame_interval {
-            thread::sleep(frame_interval - spent);
+            timer.sleep(frame_interval - spent);
         }
     }
 
@@ -497,6 +584,9 @@ mod tests {
     fn fit_output_downscales_preserving_aspect() {
         assert_eq!(fit_output(3840, 2160, 1920, 1080), (1920, 1080));
         assert_eq!(fit_output(5120, 1440, 2000, 2000), (2000, 563));
+        // Mild downscale (<= 1.5x) is left to GPU bilinear filtering.
+        assert_eq!(fit_output(1920, 1080, 1920, 1040), (1920, 1080));
+        assert_eq!(fit_output(1920, 1080, 1280, 760), (1920, 1080));
         // Never upscale.
         assert_eq!(fit_output(800, 600, 1920, 1080), (800, 600));
         // No requested limit: still capped to the texture limit.

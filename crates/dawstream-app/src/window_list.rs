@@ -57,8 +57,9 @@ const DAW_CLASS_PREFIXES: &[&str] = &[
 /// without `.exe`). Window titles are NOT used: words like "reason" or "waveform" appear
 /// in ordinary documents/chats, and auto-selecting one would stream it to Discord.
 const DAW_EXE_EXACT: &[&str] = &[
-    "fl", "fl64", "reaper", "studio one", "bitwig studio", "bitwigstudio", "protools",
-    "reason", "cakewalk", "sonar", "renoise", "lmms", "mpc beats", "acid", "acidpro",
+    "fl", "fl64", "fl (scaled)", "fl64 (scaled)", "reaper", "studio one", "bitwig studio",
+    "bitwigstudio", "protools", "reason", "cakewalk", "sonar", "renoise", "lmms", "mpc beats",
+    "acid", "acidpro",
 ];
 
 /// Versioned executables (e.g. `Ableton Live 12 Suite.exe`, `Cubase13.exe`, `Waveform13.exe`).
@@ -105,7 +106,7 @@ fn daw_rank(class_name: &str, exe_stem: Option<&str>, owned: bool) -> u8 {
         .iter()
         .any(|p| class_lower.starts_with(p))
     {
-        return 3;
+        return if owned { 1 } else { 3 };
     }
 
     match exe_stem.map(is_daw_exe) {
@@ -235,4 +236,30 @@ pub fn list_windows() -> Vec<WindowInfo> {
     });
 
     state.windows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owned_daw_class_windows_rank_below_main_window() {
+        assert_eq!(daw_rank("SteinbergWindowClass", Some("cubase13"), false), 3);
+        assert_eq!(daw_rank("SteinbergWindowClass", Some("cubase13"), true), 1);
+        assert_eq!(
+            daw_rank("Ableton Live Window Class", Some("ableton live 12 suite"), false),
+            3
+        );
+        assert_eq!(
+            daw_rank("Ableton Live Window Class", Some("ableton live 12 suite"), true),
+            1
+        );
+    }
+
+    #[test]
+    fn scaled_fl_studio_exe_recognized() {
+        assert!(is_daw_exe("fl64 (scaled)"));
+        assert!(is_daw_exe("fl (scaled)"));
+        assert_eq!(daw_rank("SomeDetachedWindow", Some("fl64 (scaled)"), false), 2);
+    }
 }

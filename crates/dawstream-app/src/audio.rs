@@ -123,12 +123,40 @@ impl Drop for MmcssGuard {
 }
 
 /// Sleeps ~`ms` in 100 ms slices while telling the plugin the app is open (without opening
-/// the audio privacy gate). Returns early when `running` clears or `wake` is set.
-fn idle_alive(ring: Option<&SharedAudioRing>, ms: u64, running: &AtomicBool, wake: Option<&AtomicBool>) {
+/// the audio privacy gate) and keeping UI connection/peak status fresh. Returns early when
+/// `running` clears or `wake` is set.
+fn idle_alive(
+    ring: Option<&SharedAudioRing>,
+    status: &Mutex<AudioStatus>,
+    ms: u64,
+    running: &AtomicBool,
+    wake: Option<&AtomicBool>,
+) {
+    let mut last_hb = ring.map(|r| r.heartbeat()).unwrap_or(0);
+    let mut last_hb_time = Instant::now();
     let mut left = ms;
     loop {
         if let Some(r) = ring {
             r.bump_app_alive();
+            let hb = r.heartbeat();
+            let connected = if hb != last_hb {
+                last_hb = hb;
+                last_hb_time = Instant::now();
+                true
+            } else {
+                last_hb_time.elapsed() < Duration::from_millis(500) && ms > 0 && left < ms
+            };
+            if let Ok(mut s) = status.try_lock() {
+                if hb != 0 && connected {
+                    s.plugin_connected = true;
+                } else if last_hb_time.elapsed() >= Duration::from_millis(500) {
+                    s.plugin_connected = false;
+                }
+                s.plugin_muted = r.plugin_muted();
+                s.sample_rate = r.sample_rate();
+                s.peak_l = 0.0;
+                s.peak_r = 0.0;
+            }
         }
         if left == 0
             || !running.load(Ordering::Acquire)
@@ -351,8 +379,10 @@ fn audio_thread_main(
             if let Ok(mut s) = status.lock() {
                 s.active_device_name = "No output selected".into();
                 s.last_error = None;
+                s.peak_l = 0.0;
+                s.peak_r = 0.0;
             }
-            idle_alive(Some(&ring), 100, &running, Some(&device_changed));
+            idle_alive(Some(&ring), &status, 100, &running, Some(&device_changed));
             continue;
         };
 
@@ -369,9 +399,11 @@ fn audio_thread_main(
         ) {
             if let Ok(mut s) = status.lock() {
                 s.last_error = Some(e);
+                s.peak_l = 0.0;
+                s.peak_r = 0.0;
             }
             // Brief backoff before retrying (the plugin still sees the app as open)
-            idle_alive(Some(&ring), 1_000, &running, Some(&device_changed));
+            idle_alive(Some(&ring), &status, 1_000, &running, Some(&device_changed));
         }
     }
 }
@@ -510,6 +542,8 @@ fn run_wasapi_session(
         let mut conditioner = StreamConditioner::new(sample_rate, buffer_frames as usize, initial_gain);
         let mut status_tick = Instant::now();
 
+        let mut session_err: Option<String> = None;
+
         while running.load(Ordering::Acquire) && !device_changed.load(Ordering::Acquire) {
             ring.bump_app_heartbeat();
 
@@ -527,12 +561,7 @@ fn run_wasapi_session(
             let padding = match audio_client.GetCurrentPadding() {
                 Ok(p) => p,
                 Err(e) => {
-                    if let Ok(mut s) = status.lock() {
-                        s.last_error = Some(format!("Output device lost ({e}), reconnecting..."));
-                        s.plugin_connected = false;
-                        s.peak_l = 0.0;
-                        s.peak_r = 0.0;
-                    }
+                    session_err = Some(format!("Output device lost ({e}), reconnecting..."));
                     break;
                 }
             };
@@ -547,7 +576,7 @@ fn run_wasapi_session(
                 } else if last_hb_time.elapsed() > Duration::from_millis(500) {
                     plugin_connected = false;
                 }
-                if let Ok(mut s) = status.lock() {
+                if let Ok(mut s) = status.try_lock() {
                     s.plugin_connected = plugin_connected;
                     s.plugin_muted = ring.plugin_muted();
                     s.peak_l = 0.0;
@@ -598,14 +627,22 @@ fn run_wasapi_session(
                         ptr,
                         sample_count * std::mem::size_of::<f32>(),
                     );
-                    if render_client.ReleaseBuffer(frames_available, 0).is_err() {
+                    if let Err(e) = render_client.ReleaseBuffer(frames_available, 0) {
+                        session_err = Some(format!("ReleaseBuffer failed ({e}), reconnecting..."));
                         break;
                     }
                 }
-                _ => break,
+                Ok(_) => {
+                    session_err = Some("GetBuffer returned null, reconnecting...".into());
+                    break;
+                }
+                Err(e) => {
+                    session_err = Some(format!("GetBuffer failed ({e}), reconnecting..."));
+                    break;
+                }
             }
 
-            // Update UI status every ~33ms
+            // Update UI status every ~33ms (try_lock avoids priority inversion on Pro Audio thread)
             if status_tick.elapsed() >= Duration::from_millis(33) {
                 status_tick = Instant::now();
                 let (pl, pr) = if plugin_connected && !muted {
@@ -614,7 +651,7 @@ fn run_wasapi_session(
                 } else {
                     (0.0, 0.0)
                 };
-                if let Ok(mut s) = status.lock() {
+                if let Ok(mut s) = status.try_lock() {
                     s.plugin_connected = plugin_connected;
                     s.plugin_muted = ring.plugin_muted();
                     s.sample_rate = sample_rate;
@@ -626,6 +663,10 @@ fn run_wasapi_session(
 
         let _ = audio_client.Stop();
         let _ = CloseHandle(event);
+
+        if let Some(err) = session_err {
+            return Err(err);
+        }
     }
 
     Ok(())
