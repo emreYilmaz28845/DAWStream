@@ -5,7 +5,6 @@
   </picture>
 </h1>
 
-<p align="center">Share your DAW on Discord <b>with sound</b>.</p>
 
 If you've ever tried to screen-share FL Studio, Ableton, Cubase etc. on Discord, you know the problem: your friends see the screen but hear nothing. That's because your DAW plays audio through ASIO, and Discord can't pick up ASIO audio.
 
