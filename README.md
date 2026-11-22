@@ -56,7 +56,7 @@ Your DAW is minimized. It can be behind other windows, just not minimized.
 **Pro Tools?**
 Doesn't work. Pro Tools only loads AAX plugins.
 
-## Under the hood
+## Technical details
 
 <details>
 <summary><b>How it works</b></summary>
