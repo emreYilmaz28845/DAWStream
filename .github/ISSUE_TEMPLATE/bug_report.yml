@@ -1,0 +1,111 @@
+name: Bug report
+description: Something doesn't work the way the README says it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Please check [Troubleshooting](https://github.com/emreYilmaz28845/DAWStream#troubleshooting) first, a lot of common problems are covered there.
+
+        **Found a security issue?** Don't post it here. See [SECURITY.md](https://github.com/emreYilmaz28845/DAWStream/blob/main/SECURITY.md).
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what did you get instead?
+      placeholder: My friends hear the stream for a few seconds, then it crackles and goes silent.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Put DAWStream on the master in FL Studio
+        2. Click Open App
+        3. Start playback
+        4. ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: DAWStream version
+      description: The release you downloaded (e.g. v0.2.0), or the commit if you built it yourself.
+    validations:
+      required: true
+
+  - type: input
+    id: daw
+    attributes:
+      label: DAW and version
+      placeholder: FL Studio 2024.2, Ableton Live 12.1, REAPER 7.x ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: format
+    attributes:
+      label: Plugin format
+      options:
+        - VST3
+        - CLAP
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install it?
+      options:
+        - Install.bat (normal)
+        - Install.bat (Run as administrator)
+        - Built from source
+        - Copied the files manually
+    validations:
+      required: true
+
+  - type: dropdown
+    id: elevated
+    attributes:
+      label: Does your DAW run as administrator?
+      options:
+        - "No"
+        - "Yes"
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      description: Run `winver` if you're not sure.
+      placeholder: Windows 11 24H2
+    validations:
+      required: true
+
+  - type: input
+    id: audio
+    attributes:
+      label: Audio setup
+      description: Your audio interface / ASIO driver, the DAW's sample rate and buffer size, and the Audio Output you picked in the DAWStream app.
+      placeholder: Focusrite Scarlett 2i2 ASIO, 48 kHz, 256 samples, app output = Realtek Digital Output
+    validations:
+      required: true
+
+  - type: textarea
+    id: status
+    attributes:
+      label: What do the plugin and the app show?
+      description: The status text (LIVE / App Offline / Standby / Waiting for Plugin ...) and any red error message. Screenshots are very welcome.
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Multiple DAWStream instances, other audio software (Voicemeeter, VB-Cable, OBS), whether it ever worked before, etc.

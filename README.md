@@ -56,6 +56,9 @@ Your DAW is minimized. It can be behind other windows, just not minimized.
 **Pro Tools?**
 Doesn't work. Pro Tools only loads AAX plugins.
 
+**Something else?**
+[Open an issue](../../issues/new/choose). The form asks for your DAW, Windows version and audio setup, which is usually what's needed to figure it out. Found a security problem? Please report it privately instead, see [SECURITY.md](SECURITY.md).
+
 ## Technical details
 
 <details>
@@ -130,7 +133,7 @@ Releases are built by [GitHub Actions](.github/workflows/release.yml) when a `v*
 | VST3 | `%LOCALAPPDATA%\Programs\Common\VST3` | `C:\Program Files\Common Files\VST3` |
 | CLAP | `%LOCALAPPDATA%\Programs\Common\CLAP` | `C:\Program Files\Common Files\CLAP` |
 
-If you've installed both ways at some point, your DAW may load the older copy. Delete the one you don't use.
+Running it as administrator also removes any earlier per-user copy, so an elevated DAW never loads a plugin from a folder your normal account can write to.
 
 If your DAW runs as administrator, the plugin's **Open App** button only launches the app from `C:\Program Files`, so use the admin install.
 

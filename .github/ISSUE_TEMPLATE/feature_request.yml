@@ -1,0 +1,25 @@
+name: Feature request
+description: An idea to make DAWStream better.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: Describe the situation or problem, not just the solution. It helps to know why you need it.
+      placeholder: When I stream to Discord I also want my friends to hear my mic, but ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like DAWStream to do?
+    validations:
+      required: true
+
+  - type: input
+    id: daw
+    attributes:
+      label: Your DAW
+      description: Optional, but useful if the idea is DAW-specific.
