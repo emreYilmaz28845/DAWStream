@@ -160,6 +160,7 @@ fn capture_loop(
                 continue;
             }
             if IsIconic(hwnd).as_bool() {
+                fps_x10.store(0, Ordering::Relaxed);
                 thread::sleep(Duration::from_millis(50));
                 continue;
             }

@@ -47,6 +47,23 @@ if "!IS_ADMIN!"=="1" (
     set "APP_DIR=C:\Program Files\DAWStream"
     set "VST3_DIR=C:\Program Files\Common Files\VST3"
     set "CLAP_DIR=C:\Program Files\Common Files\CLAP"
+    REM Remove any earlier per-user copies: an elevated DAW also scans the user-writable
+    REM %LOCALAPPDATA%\Programs\Common\VST3 folder and would load that copy at High IL.
+    for /f "usebackq delims=" %%P in (`"%SYS_PS%" -NoProfile -Command "[Environment]::GetFolderPath('LocalApplicationData')"`) do set "USER_LOCALAPPDATA=%%P"
+    if defined USER_LOCALAPPDATA (
+        if exist "!USER_LOCALAPPDATA!\Programs\Common\VST3\DAWStream.vst3" (
+            rmdir /S /Q "!USER_LOCALAPPDATA!\Programs\Common\VST3\DAWStream.vst3" >nul 2>&1
+            echo   Removed per-user VST3 copy.
+        )
+        if exist "!USER_LOCALAPPDATA!\Programs\Common\CLAP\DAWStream.clap" (
+            del /F /Q "!USER_LOCALAPPDATA!\Programs\Common\CLAP\DAWStream.clap" >nul 2>&1
+            echo   Removed per-user CLAP copy.
+        )
+        if exist "!USER_LOCALAPPDATA!\DAWStream\DAWStream.exe" (
+            rmdir /S /Q "!USER_LOCALAPPDATA!\DAWStream" >nul 2>&1
+            echo   Removed per-user app copy.
+        )
+    )
 ) else (
     echo Mode: Standard User ^(Per-user installation^)
     for /f "usebackq delims=" %%P in (`"%SYS_PS%" -NoProfile -Command "[Environment]::GetFolderPath('LocalApplicationData')"`) do set "REAL_LOCALAPPDATA=%%P"
@@ -100,7 +117,7 @@ if exist "!DIST_DIR!\DAWStream.clap" (
 
 echo [4/4] Creating Desktop shortcut...
 set "TARGET_APP_DIR=!APP_DIR!"
-"%SYS_PS%" -NoProfile -ExecutionPolicy Bypass -Command "$s=(New-Object -COM WScript.Shell).CreateShortcut((Join-Path ([Environment]::GetFolderPath('Desktop')) 'DAWStream.lnk'));$s.TargetPath=(Join-Path $env:TARGET_APP_DIR 'DAWStream.exe');$s.WorkingDirectory=$env:TARGET_APP_DIR;$s.Description='DAWStream - Discord DAW Streaming';$s.Save()"
+"%SYS_PS%" -NoProfile -ExecutionPolicy Bypass -Command "$p=Join-Path ([Environment]::GetFolderPath('Desktop')) 'DAWStream.lnk';if(Test-Path -LiteralPath $p){Remove-Item -LiteralPath $p -Force -ErrorAction Stop};$s=(New-Object -COM WScript.Shell).CreateShortcut($p);$s.TargetPath=(Join-Path $env:TARGET_APP_DIR 'DAWStream.exe');$s.WorkingDirectory=$env:TARGET_APP_DIR;$s.Description='DAWStream - Discord DAW Streaming';$s.Save()"
 if !errorlevel! neq 0 (
     echo   WARNING: Could not create Desktop shortcut.
 ) else (

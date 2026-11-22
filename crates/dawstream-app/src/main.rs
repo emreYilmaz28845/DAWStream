@@ -14,7 +14,8 @@ use eframe::egui;
 use window_list::{list_windows, WindowInfo};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, SetLastError, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE,
+    CloseHandle, GetLastError, SetLastError, BOOL, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE,
+    HWND, LPARAM,
 };
 use windows::Win32::System::LibraryLoader::{
     SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_SYSTEM32,
@@ -24,14 +25,15 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetWindowThreadProcessId, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    EnumWindows, GetWindowTextW, GetWindowThreadProcessId, SetForegroundWindow, ShowWindow,
+    SW_RESTORE,
 };
 
 const APP_WINDOW_TITLE: &str = "DAWStream — Discord DAW Streaming";
 
 struct SingleInstanceGuard(HANDLE);
 
-unsafe fn hwnd_belongs_to_dawstream(hwnd: windows::Win32::Foundation::HWND) -> bool {
+unsafe fn hwnd_belongs_to_dawstream(hwnd: HWND) -> bool {
     let mut pid: u32 = 0;
     GetWindowThreadProcessId(hwnd, Some(&mut pid));
     if pid == 0 {
@@ -64,6 +66,19 @@ unsafe fn hwnd_belongs_to_dawstream(hwnd: windows::Win32::Foundation::HWND) -> b
         .unwrap_or(false)
 }
 
+unsafe extern "system" fn find_existing_instance(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let mut buf = [0u16; 128];
+    let n = GetWindowTextW(hwnd, &mut buf);
+    if n > 0
+        && String::from_utf16_lossy(&buf[..n as usize]) == APP_WINDOW_TITLE
+        && hwnd_belongs_to_dawstream(hwnd)
+    {
+        *(lparam.0 as *mut HWND) = hwnd;
+        return BOOL(0); // stop enumeration
+    }
+    BOOL(1)
+}
+
 impl SingleInstanceGuard {
     /// Returns `None` if another instance of DAWStream.exe is already running
     /// (bringing it to the foreground only after verifying its process image name),
@@ -79,12 +94,16 @@ impl SingleInstanceGuard {
                 return None;
             };
             if GetLastError() == ERROR_ALREADY_EXISTS {
-                let title: Vec<u16> = format!("{APP_WINDOW_TITLE}\0").encode_utf16().collect();
-                if let Ok(hwnd) = FindWindowW(None, PCWSTR(title.as_ptr())) {
-                    if hwnd_belongs_to_dawstream(hwnd) {
-                        let _ = ShowWindow(hwnd, SW_RESTORE);
-                        let _ = SetForegroundWindow(hwnd);
-                    }
+                // Walk ALL top-level windows: a same-titled window from another process
+                // higher in Z-order must not shadow the real DAWStream window.
+                let mut found = HWND::default();
+                let _ = EnumWindows(
+                    Some(find_existing_instance),
+                    LPARAM(&mut found as *mut HWND as isize),
+                );
+                if !found.0.is_null() {
+                    let _ = ShowWindow(found, SW_RESTORE);
+                    let _ = SetForegroundWindow(found);
                 }
                 let _ = CloseHandle(handle);
                 return None;

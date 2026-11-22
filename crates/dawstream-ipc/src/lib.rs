@@ -1,5 +1,5 @@
 //! Lock-free Single-Producer Single-Consumer (SPSC) audio ring buffer
-//! backed by Windows Named Shared Memory (`Local\DAWStream_AudioRing_v2`).
+//! backed by Windows Named Shared Memory (`Local\DAWStream_AudioRing_v4`).
 //!
 //! Real-time safe on the producer (VST3/CLAP audio thread) side:
 //! zero allocations, zero locks, pure atomic operations, NaN/Inf sanitization,
@@ -8,23 +8,35 @@
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, LocalFree, ERROR_ALREADY_EXISTS, HANDLE, INVALID_HANDLE_VALUE,
 };
-use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+    SE_KERNEL_OBJECT,
+};
+use windows_sys::Win32::Security::{
+    GetAce, GetSidSubAuthority, GetSidSubAuthorityCount, ACL, LABEL_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SYSTEM_MANDATORY_LABEL_ACE,
+};
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, VirtualQuery, FILE_MAP_ALL_ACCESS,
     MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
 };
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 
-pub const SHARED_MEM_NAME: &str = "Local\\DAWStream_AudioRing_v3";
+pub const SHARED_MEM_NAME: &str = "Local\\DAWStream_AudioRing_v4";
 pub const MAGIC: u32 = 0x4441_5753; // "DAWS"
 const MAGIC_INITING: u32 = 0x494E_4954; // "INIT"
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
+
+// Mandatory-label constants (winnt.h)
+const SYSTEM_MANDATORY_LABEL_ACE_TYPE: u8 = 0x11;
+const SYSTEM_MANDATORY_LABEL_NO_WRITE_UP: u32 = 0x1;
+const SYSTEM_MANDATORY_LABEL_NO_READ_UP: u32 = 0x2;
+const SECURITY_MANDATORY_MEDIUM_RID: u32 = 0x2000;
 
 pub const MIN_SAMPLE_RATE: u32 = 22_050;
 pub const MAX_SAMPLE_RATE: u32 = 192_000;
@@ -73,12 +85,11 @@ pub struct SharedAudioBlock {
     /// Monotonic tick (`GetTickCount64`) when the companion app was last active.
     pub app_last_tick_ms: AtomicU64,
 
-    /// Multi-instance guard: only the instance matching `active_owner_id`
-    /// writes into the ring buffer.
-    pub active_owner_id: AtomicU64,
+    /// Multi-instance guard, packed so owner + lease timestamp change in ONE atomic op:
+    /// high 32 bits = owner instance id (0 = none), low 32 bits = `GetTickCount64() as u32`
+    /// of the owner's last `process()` call.
+    pub owner_lease: AtomicU64,
     pub next_instance_id: AtomicU64,
-    /// Monotonic tick (`GetTickCount64`) when the active owner last processed audio.
-    pub owner_last_tick_ms: AtomicU64,
 
     /// Interleaved stereo f32 samples stored as atomic bit patterns: `[L0, R0, L1, R1, ...]`.
     pub samples: [AtomicU32; RING_FRAMES * CHANNELS],
@@ -88,6 +99,9 @@ pub struct SharedAudioBlock {
 pub struct SharedAudioRing {
     handle: HANDLE,
     view: *mut SharedAudioBlock,
+    /// Consumer-local (not shared): `true` while waiting for the ring to refill
+    /// to the target latency cushion after startup or an underrun.
+    consumer_buffering: AtomicBool,
 }
 
 unsafe impl Send for SharedAudioRing {}
@@ -96,6 +110,70 @@ unsafe impl Sync for SharedAudioRing {}
 #[inline]
 fn now_tick_ms() -> u64 {
     unsafe { GetTickCount64() }
+}
+
+#[inline]
+fn pack_lease(id: u32, tick: u32) -> u64 {
+    ((id as u64) << 32) | tick as u64
+}
+
+#[inline]
+fn lease_owner(v: u64) -> u32 {
+    (v >> 32) as u32
+}
+
+#[inline]
+fn lease_tick(v: u64) -> u32 {
+    v as u32
+}
+
+/// Verifies that an already-existing section carries an explicit mandatory label of at
+/// least Medium integrity with No-Read-Up + No-Write-Up. A Low-IL process cannot create
+/// an object labelled above its own integrity level, so this rejects squatted sections.
+unsafe fn existing_section_is_trusted(handle: HANDLE) -> bool {
+    let mut sacl: *mut ACL = ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    let err = GetSecurityInfo(
+        handle,
+        SE_KERNEL_OBJECT,
+        LABEL_SECURITY_INFORMATION,
+        ptr::null_mut(),
+        ptr::null_mut(),
+        ptr::null_mut(),
+        &mut sacl,
+        &mut sd,
+    );
+    if err != 0 {
+        return false;
+    }
+
+    let mut trusted = false;
+    if !sacl.is_null() {
+        for i in 0..(*sacl).AceCount as u32 {
+            let mut ace: *mut core::ffi::c_void = ptr::null_mut();
+            if GetAce(sacl, i, &mut ace) == 0 || ace.is_null() {
+                continue;
+            }
+            let label = &*(ace as *const SYSTEM_MANDATORY_LABEL_ACE);
+            if label.Header.AceType != SYSTEM_MANDATORY_LABEL_ACE_TYPE {
+                continue;
+            }
+            let sid = &label.SidStart as *const u32 as PSID;
+            let count = *GetSidSubAuthorityCount(sid);
+            if count == 0 {
+                break;
+            }
+            let rid = *GetSidSubAuthority(sid, count as u32 - 1);
+            let policy = SYSTEM_MANDATORY_LABEL_NO_READ_UP | SYSTEM_MANDATORY_LABEL_NO_WRITE_UP;
+            trusted = rid >= SECURITY_MANDATORY_MEDIUM_RID && (label.Mask & policy) == policy;
+            break;
+        }
+    }
+
+    if !sd.is_null() {
+        LocalFree(sd);
+    }
+    trusted
 }
 
 #[inline]
@@ -139,6 +217,13 @@ impl SharedAudioRing {
                 &mut sd,
                 ptr::null_mut(),
             ) != 0;
+            // Fail closed: never create the section with a default (label-less) descriptor.
+            if !sd_ok || sd.is_null() {
+                return Err(format!(
+                    "Failed to build shared memory security descriptor: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
 
             let sa = SECURITY_ATTRIBUTES {
                 nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -148,22 +233,31 @@ impl SharedAudioRing {
 
             let handle = CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
-                if sd_ok { &sa } else { ptr::null() },
+                &sa,
                 PAGE_READWRITE,
                 size_high,
                 size_low,
                 wide_name.as_ptr(),
             );
+            // Must be read before any other API call clobbers it.
+            let already_existed = GetLastError() == ERROR_ALREADY_EXISTS;
 
-            if sd_ok && !sd.is_null() {
-                LocalFree(sd);
-            }
+            LocalFree(sd);
 
             if handle.is_null() {
                 return Err(format!(
                     "CreateFileMappingW failed with OS error: {}",
                     std::io::Error::last_os_error()
                 ));
+            }
+
+            // When the section already exists our SECURITY_ATTRIBUTES were ignored,
+            // so verify the existing object was not pre-created by a lower-integrity process.
+            if already_existed && !existing_section_is_trusted(handle) {
+                CloseHandle(handle);
+                return Err(
+                    "Shared memory section exists with an untrusted security label".into(),
+                );
             }
 
             let view = MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, size);
@@ -206,9 +300,8 @@ impl SharedAudioRing {
                 block_ref.plugin_muted.store(0, Ordering::Release);
                 block_ref.app_heartbeat.store(0, Ordering::Release);
                 block_ref.app_last_tick_ms.store(0, Ordering::Release);
-                block_ref.active_owner_id.store(0, Ordering::Release);
+                block_ref.owner_lease.store(0, Ordering::Release);
                 block_ref.next_instance_id.store(1, Ordering::Release);
-                block_ref.owner_last_tick_ms.store(0, Ordering::Release);
                 block_ref.magic.store(MAGIC, Ordering::Release);
             } else {
                 // Spin briefly if another process is mid-initialization
@@ -228,7 +321,11 @@ impl SharedAudioRing {
                 }
             }
 
-            Ok(Self { handle, view: block })
+            Ok(Self {
+                handle,
+                view: block,
+                consumer_buffering: AtomicBool::new(true),
+            })
         }
     }
 
@@ -278,7 +375,8 @@ impl SharedAudioRing {
         let consumer_active =
             app_tick != 0 && app_tick <= now && now.saturating_sub(app_tick) <= CONSUMER_ACTIVE_TIMEOUT_MS;
 
-        let mut wpos = b.write_pos.load(Ordering::Relaxed);
+        let start_wpos = b.write_pos.load(Ordering::Acquire);
+        let mut wpos = start_wpos;
         let mut peak_l = 0.0f32;
         let mut peak_r = 0.0f32;
 
@@ -290,7 +388,7 @@ impl SharedAudioRing {
                     b.samples[idx + 1].store(0, Ordering::Relaxed);
                     wpos = wpos.wrapping_add(1);
                 }
-                b.write_pos.store(wpos, Ordering::Release);
+                Self::commit_write_pos(b, start_wpos, wpos);
             }
         } else {
             for i in 0..frames {
@@ -308,37 +406,66 @@ impl SharedAudioRing {
                 }
             }
             if consumer_active {
-                b.write_pos.store(wpos, Ordering::Release);
+                Self::commit_write_pos(b, start_wpos, wpos);
             }
         }
 
         b.peak_l_bits.store(peak_l.to_bits(), Ordering::Relaxed);
         b.peak_r_bits.store(peak_r.to_bits(), Ordering::Relaxed);
-        b.owner_last_tick_ms.store(now, Ordering::Release);
         b.heartbeat.fetch_add(1, Ordering::Release);
     }
 
+    /// Publishes a new write cursor only if no other producer advanced it meanwhile
+    /// (e.g. during a "Take Over" hand-off), keeping `write_pos` consistent.
+    #[inline]
+    fn commit_write_pos(b: &SharedAudioBlock, start: u64, end: u64) {
+        let _ = b
+            .write_pos
+            .compare_exchange(start, end, Ordering::AcqRel, Ordering::Relaxed);
+    }
+
     /// Consumer: reads interleaved stereo frames into `out` (`out.len() == frames * 2`).
-    /// Automatically keeps latency bounded around `target_latency_frames`.
+    /// Keeps a cushion of about `target_latency_frames` in the ring: after startup or an
+    /// underrun it outputs silence until the cushion has been rebuilt, instead of
+    /// running with zero headroom and glitching on every scheduling jitter.
     /// Returns the number of frames read from the ring (remainder is zero-filled).
     pub fn read_interleaved(&self, out: &mut [f32], target_latency_frames: u64) -> usize {
         let requested_frames = out.len() / 2;
         if requested_frames == 0 {
             return 0;
         }
+        let requested = requested_frames as u64;
 
         let b = self.block();
         let wpos = b.write_pos.load(Ordering::Acquire);
         let mut rpos = b.read_pos.load(Ordering::Relaxed);
 
-        let max_drift = (target_latency_frames * 3).max(requested_frames as u64 * 4);
-        let available = wpos.wrapping_sub(rpos);
+        let max_drift = (target_latency_frames * 3).max(requested * 4);
+        let mut available = wpos.wrapping_sub(rpos);
 
+        // Overrun (or cursor corruption): jump back to target latency.
         if available > (RING_FRAMES as u64) || available > max_drift {
             rpos = wpos.saturating_sub(target_latency_frames);
+            available = wpos.wrapping_sub(rpos);
         }
 
-        let available = wpos.wrapping_sub(rpos);
+        let mut buffering = self.consumer_buffering.load(Ordering::Relaxed);
+        if !buffering && available < requested {
+            // Underrun: stop draining and rebuild the cushion.
+            buffering = true;
+        }
+        if buffering {
+            if available >= target_latency_frames + requested {
+                buffering = false;
+            } else {
+                self.consumer_buffering.store(true, Ordering::Relaxed);
+                out[..requested_frames * 2].fill(0.0);
+                b.read_pos.store(rpos, Ordering::Release);
+                return 0;
+            }
+        }
+        self.consumer_buffering.store(buffering, Ordering::Relaxed);
+
         let to_read = (available as usize).min(requested_frames);
 
         for i in 0..to_read {
@@ -364,6 +491,7 @@ impl SharedAudioRing {
         let wpos = b.write_pos.load(Ordering::Acquire);
         b.read_pos
             .store(wpos.saturating_sub(target_latency_frames), Ordering::Release);
+        self.consumer_buffering.store(true, Ordering::Relaxed);
     }
 
     #[inline]
@@ -401,72 +529,93 @@ impl SharedAudioRing {
         self.block().app_heartbeat.load(Ordering::Acquire)
     }
 
-    /// Allocates a unique non-zero producer instance ID.
+    /// Allocates a unique non-zero producer instance ID (fits in 32 bits).
     #[inline]
     pub fn alloc_instance_id(&self) -> u64 {
-        let id = self.block().next_instance_id.fetch_add(1, Ordering::AcqRel);
-        if id == 0 {
-            self.block().next_instance_id.fetch_add(1, Ordering::AcqRel)
-        } else {
-            id
+        loop {
+            let id = self.block().next_instance_id.fetch_add(1, Ordering::AcqRel) as u32;
+            if id != 0 {
+                return id as u64;
+            }
         }
     }
 
-    /// Returns `true` if `instance_id` is (or successfully claimed) the active producer.
-    /// Automatically reclaims ownership if the previous owner has been silent for longer
-    /// than `OWNER_LEASE_TIMEOUT_MS` (e.g. after a DAW crash).
-    /// Real-time safe.
+    #[inline]
+    fn lease_id(instance_id: u64) -> Option<u32> {
+        match u32::try_from(instance_id) {
+            Ok(0) | Err(_) => None,
+            Ok(id) => Some(id),
+        }
+    }
+
+    /// Returns `true` if `instance_id` is (or successfully claimed) the active producer,
+    /// and refreshes its lease. Automatically reclaims ownership if the previous owner has
+    /// been silent for longer than `OWNER_LEASE_TIMEOUT_MS` (e.g. after a DAW crash).
+    /// Owner id and lease timestamp live in one `AtomicU64`, so two instances can never
+    /// both win a claim. Real-time safe.
     #[inline]
     pub fn is_or_claim_owner(&self, instance_id: u64) -> bool {
-        if instance_id == 0 {
+        let Some(id) = Self::lease_id(instance_id) else {
             return false;
-        }
+        };
         let b = self.block();
-        let owner = b.active_owner_id.load(Ordering::Acquire);
-        if owner == instance_id {
-            return true;
+        let now = now_tick_ms() as u32;
+        let cur = b.owner_lease.load(Ordering::Acquire);
+        let owner = lease_owner(cur);
+
+        if owner == id {
+            // Refresh lease; if a concurrent write changed it, re-check who owns it now.
+            return match b.owner_lease.compare_exchange(
+                cur,
+                pack_lease(id, now),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => true,
+                Err(actual) => lease_owner(actual) == id,
+            };
         }
 
-        let now = now_tick_ms();
-        let last_tick = b.owner_last_tick_ms.load(Ordering::Acquire);
-        let stale = owner == 0
-            || last_tick == 0
-            || last_tick > now
-            || now.saturating_sub(last_tick) > OWNER_LEASE_TIMEOUT_MS;
-
-        if stale
-            && b.active_owner_id
-                .compare_exchange(owner, instance_id, Ordering::AcqRel, Ordering::Acquire)
+        let age = now.wrapping_sub(lease_tick(cur));
+        let stale = owner == 0 || age > OWNER_LEASE_TIMEOUT_MS as u32;
+        stale
+            && b.owner_lease
+                .compare_exchange(cur, pack_lease(id, now), Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
-        {
-            b.owner_last_tick_ms.store(now, Ordering::Release);
-            return true;
-        }
-        false
     }
 
     /// Forces `instance_id` to become the active producer ("Take Over").
     #[inline]
     pub fn force_claim_owner(&self, instance_id: u64) {
-        let b = self.block();
-        b.active_owner_id.store(instance_id, Ordering::Release);
-        b.owner_last_tick_ms.store(now_tick_ms(), Ordering::Release);
+        if let Some(id) = Self::lease_id(instance_id) {
+            self.block()
+                .owner_lease
+                .store(pack_lease(id, now_tick_ms() as u32), Ordering::Release);
+        }
     }
 
     /// Releases ownership if `instance_id` currently owns the stream.
     #[inline]
     pub fn release_owner(&self, instance_id: u64) {
-        let _ = self.block().active_owner_id.compare_exchange(
-            instance_id,
-            0,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        let Some(id) = Self::lease_id(instance_id) else {
+            return;
+        };
+        let b = self.block();
+        let mut cur = b.owner_lease.load(Ordering::Acquire);
+        while lease_owner(cur) == id {
+            match b
+                .owner_lease
+                .compare_exchange(cur, 0, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return,
+                Err(actual) => cur = actual,
+            }
+        }
     }
 
     #[inline]
     pub fn active_owner_id(&self) -> u64 {
-        self.block().active_owner_id.load(Ordering::Acquire)
+        lease_owner(self.block().owner_lease.load(Ordering::Acquire)) as u64
     }
 }
 
@@ -510,7 +659,7 @@ mod tests {
         producer.write_planar(&left, &right, 1.0, false);
 
         let mut out = [0.0f32; 8];
-        let read = consumer.read_interleaved(&mut out, 64);
+        let read = consumer.read_interleaved(&mut out, 0);
         assert_eq!(read, 4);
         assert_eq!(out, [0.25, -0.25, -0.5, 0.5, 0.75, -0.75, 1.0, -1.0]);
     }
@@ -540,7 +689,7 @@ mod tests {
         ring.write_planar(&left, &right, 1.0, false);
 
         let mut out = [0.0f32; 8];
-        let read = ring.read_interleaved(&mut out, 64);
+        let read = ring.read_interleaved(&mut out, 0);
         assert_eq!(read, 4);
         for s in out {
             assert!(s.is_finite());
@@ -591,10 +740,77 @@ mod tests {
         // Exceed RING_FRAMES (65536) to exercise wrap-around
         for _ in 0..70 {
             ring.write_planar(&chunk_l, &chunk_r, 1.0, false);
-            let n = ring.read_interleaved(&mut out, 1024);
+            let n = ring.read_interleaved(&mut out, 0);
             assert_eq!(n, 1024);
             assert_eq!(out[0], 0.5);
             assert_eq!(out[1], -0.5);
         }
+    }
+
+    #[test]
+    fn underrun_rebuilds_latency_cushion() {
+        let name = unique_name("rebuffer");
+        let ring = SharedAudioRing::open_or_create_named(&name).unwrap();
+        ring.bump_app_heartbeat();
+        ring.resync_consumer(8);
+        let mut out = [1.0f32; 8]; // 4 frames
+
+        // Not enough for target (8) + request (4): keep buffering, output silence
+        ring.write_planar(&[0.5; 4], &[0.5; 4], 1.0, false);
+        assert_eq!(ring.read_interleaved(&mut out, 8), 0);
+        assert_eq!(out, [0.0; 8]);
+
+        // 12 frames available -> playback starts and leaves an 8-frame cushion
+        ring.write_planar(&[0.5; 8], &[0.5; 8], 1.0, false);
+        assert_eq!(ring.read_interleaved(&mut out, 8), 4);
+        assert_eq!(ring.read_interleaved(&mut out, 8), 4);
+        assert_eq!(ring.read_interleaved(&mut out, 8), 4);
+
+        // Ring empty -> underrun: go back to buffering, do not drain partial blocks
+        assert_eq!(ring.read_interleaved(&mut out, 8), 0);
+        ring.write_planar(&[0.5; 4], &[0.5; 4], 1.0, false);
+        assert_eq!(ring.read_interleaved(&mut out, 8), 0);
+    }
+
+    #[test]
+    fn concurrent_claims_have_single_winner() {
+        use std::sync::{Arc, Barrier};
+        for round in 0..50 {
+            let name = unique_name(&format!("race{round}"));
+            let ring = Arc::new(SharedAudioRing::open_or_create_named(&name).unwrap());
+            let n = 8;
+            let barrier = Arc::new(Barrier::new(n));
+            let handles: Vec<_> = (0..n)
+                .map(|_| {
+                    let ring = ring.clone();
+                    let barrier = barrier.clone();
+                    let id = ring.alloc_instance_id();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        ring.is_or_claim_owner(id)
+                    })
+                })
+                .collect();
+            let winners = handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .filter(|w| *w)
+                .count();
+            assert_eq!(winners, 1);
+        }
+    }
+
+    #[test]
+    fn rejects_section_without_integrity_label() {
+        let name = unique_name("squat");
+        let wide: Vec<u16> = OsStr::new(&name).encode_wide().chain(std::iter::once(0)).collect();
+        let size = std::mem::size_of::<SharedAudioBlock>() as u32;
+        // Pre-create the section with a default (label-less) security descriptor
+        let squat = unsafe {
+            CreateFileMappingW(INVALID_HANDLE_VALUE, ptr::null(), PAGE_READWRITE, 0, size, wide.as_ptr())
+        };
+        assert!(!squat.is_null());
+        assert!(SharedAudioRing::open_or_create_named(&name).is_err());
+        unsafe { CloseHandle(squat) };
     }
 }

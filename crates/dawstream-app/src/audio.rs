@@ -464,8 +464,25 @@ fn run_wasapi_session(
             }
 
             let wait = WaitForSingleObject(event, 100);
+
+            // Polled on timeouts too: an invalidated device (unplugged, format change,
+            // exclusive-mode takeover) stops signalling the event, and this is where
+            // AUDCLNT_E_DEVICE_INVALIDATED surfaces so the session can be rebuilt.
+            let padding = match audio_client.GetCurrentPadding() {
+                Ok(p) => p,
+                Err(e) => {
+                    if let Ok(mut s) = status.lock() {
+                        s.last_error = Some(format!("Output device lost ({e}), reconnecting..."));
+                        s.plugin_connected = false;
+                        s.peak_l = 0.0;
+                        s.peak_r = 0.0;
+                    }
+                    break;
+                }
+            };
+
             if wait != WAIT_OBJECT_0 {
-                // Timeout: still update connection state
+                // Timeout: still update connection state and the UI
                 let hb = ring.heartbeat();
                 if hb != last_hb {
                     last_hb = hb;
@@ -474,13 +491,14 @@ fn run_wasapi_session(
                 } else if last_hb_time.elapsed() > Duration::from_millis(500) {
                     plugin_connected = false;
                 }
+                if let Ok(mut s) = status.lock() {
+                    s.plugin_connected = plugin_connected;
+                    s.plugin_muted = ring.plugin_muted();
+                    s.peak_l = 0.0;
+                    s.peak_r = 0.0;
+                }
                 continue;
             }
-
-            let padding = match audio_client.GetCurrentPadding() {
-                Ok(p) => p,
-                Err(_) => break,
-            };
             let frames_available = buffer_frames.saturating_sub(padding);
             if frames_available == 0 {
                 continue;

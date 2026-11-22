@@ -1,5 +1,12 @@
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+use std::collections::HashMap;
+
+use windows::core::PWSTR;
+use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetWindowLongW, GetWindowRect, GetWindowTextW,
     GetWindowThreadProcessId, IsIconic, IsWindowVisible, GWL_EXSTYLE, WS_EX_TOOLWINDOW,
@@ -32,31 +39,46 @@ const DAW_CLASS_PREFIXES: &[&str] = &[
     "bitwig",                 // Bitwig Studio
 ];
 
-const DAW_KEYWORDS: &[&str] = &[
-    "fl studio",
-    "ableton live",
-    "cubase",
-    "nuendo",
-    "reaper",
-    "studio one",
-    "bitwig studio",
-    "pro tools",
-    "reason",
-    "cakewalk",
-    "sonar",
-    "waveform",
-    "mixcraft",
-    "renoise",
-    "ardour",
-    "samplitude",
-    "sequoia",
-    "acid pro",
-    "mpc beats",
-    "maschine",
-    "lmms",
+/// Known DAW executables, matched against the owning process's image name (lowercase,
+/// without `.exe`). Window titles are NOT used: words like "reason" or "waveform" appear
+/// in ordinary documents/chats, and auto-selecting one would stream it to Discord.
+const DAW_EXE_EXACT: &[&str] = &[
+    "fl", "fl64", "reaper", "studio one", "bitwig studio", "bitwigstudio", "protools",
+    "reason", "cakewalk", "sonar", "renoise", "lmms", "mpc beats", "acid", "acidpro",
 ];
 
-fn is_daw_window(class_name: &str, title: &str) -> bool {
+/// Versioned executables (e.g. `Ableton Live 12 Suite.exe`, `Cubase13.exe`, `Waveform13.exe`).
+const DAW_EXE_PREFIXES: &[&str] = &[
+    "ableton live", "cubase", "nuendo", "waveform", "mixcraft", "ardour", "samplitude",
+    "sequoia", "maschine", "acid pro",
+];
+
+fn is_daw_exe(stem_lower: &str) -> bool {
+    DAW_EXE_EXACT.contains(&stem_lower)
+        || DAW_EXE_PREFIXES.iter().any(|p| stem_lower.starts_with(p))
+}
+
+/// Lowercase executable stem (`fl64`, `ableton live 12 suite`, ...) of a process.
+fn process_exe_stem(pid: u32) -> Option<String> {
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len)
+            .is_ok();
+        let _ = CloseHandle(handle);
+        if !ok || len == 0 {
+            return None;
+        }
+        let full = String::from_utf16_lossy(&buf[..len as usize]);
+        std::path::Path::new(&full)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_lowercase())
+    }
+}
+
+fn is_daw_window(class_name: &str, exe_stem: Option<&str>) -> bool {
     let class_lower = class_name.to_lowercase();
     if NON_DAW_CLASSES.iter().any(|c| class_lower == *c) {
         return false;
@@ -69,18 +91,13 @@ fn is_daw_window(class_name: &str, title: &str) -> bool {
         return true;
     }
 
-    // Avoid matching raw file paths like "C:\Users\...\FL Studio\..."
-    if title.contains(":\\") {
-        return false;
-    }
-
-    let title_lower = title.to_lowercase();
-    DAW_KEYWORDS.iter().any(|kw| title_lower.contains(kw))
+    exe_stem.map(is_daw_exe).unwrap_or(false)
 }
 
 struct EnumState {
     self_pid: u32,
     windows: Vec<WindowInfo>,
+    exe_cache: HashMap<u32, Option<String>>,
 }
 
 unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
@@ -116,7 +133,7 @@ unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
     if GetWindowRect(hwnd, &mut rect).is_err() {
         return BOOL(1);
     }
-    if (rect.right - rect.left) < 100 || (rect.bottom - rect.top) < 80 {
+    if rect.right.saturating_sub(rect.left) < 100 || rect.bottom.saturating_sub(rect.top) < 80 {
         return BOOL(1);
     }
 
@@ -140,7 +157,11 @@ unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
         String::new()
     };
 
-    let is_daw = is_daw_window(&class_name, &title);
+    let exe_stem = state
+        .exe_cache
+        .entry(pid)
+        .or_insert_with(|| process_exe_stem(pid));
+    let is_daw = is_daw_window(&class_name, exe_stem.as_deref());
     state.windows.push(WindowInfo {
         hwnd: hwnd.0 as isize,
         pid,
@@ -155,6 +176,7 @@ pub fn list_windows() -> Vec<WindowInfo> {
     let mut state = EnumState {
         self_pid: std::process::id(),
         windows: Vec::new(),
+        exe_cache: HashMap::new(),
     };
 
     unsafe {

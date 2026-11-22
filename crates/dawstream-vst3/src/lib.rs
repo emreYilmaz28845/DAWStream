@@ -27,6 +27,8 @@ pub struct DawStreamPlugin {
     params: Arc<DawStreamParams>,
     ring: Option<Arc<SharedAudioRing>>,
     instance_id: Arc<AtomicU64>,
+    /// Host sample rate from `initialize()`, published by whichever instance owns the stream.
+    sample_rate: u32,
 }
 
 impl Drop for DawStreamPlugin {
@@ -86,6 +88,7 @@ impl Default for DawStreamPlugin {
             params: Arc::new(DawStreamParams::default()),
             ring,
             instance_id: Arc::new(AtomicU64::new(id)),
+            sample_rate: 48_000,
         }
     }
 }
@@ -96,6 +99,8 @@ struct EditorUiState {
     last_app_hb: u64,
     last_app_hb_time: Option<Instant>,
     app_connected: bool,
+    last_plugin_hb: u64,
+    last_plugin_hb_time: Instant,
     smooth_l: f32,
     smooth_r: f32,
     launch_error: Option<(String, Instant)>,
@@ -192,6 +197,11 @@ fn validate_companion_exe(raw: &str) -> Option<PathBuf> {
     if canon_str.to_ascii_uppercase().starts_with(r"\\?\UNC\") {
         return None;
     }
+    // Re-check the drive AFTER resolving symlinks/junctions
+    let plain = canon_str.strip_prefix(r"\\?\").unwrap_or(&canon_str);
+    if !is_not_remote_drive(Path::new(plain)) {
+        return None;
+    }
 
     // Re-check file name AFTER resolving symlinks/junctions (closes MEDIUM #13)
     if !is_allowed_exe_name(&canonical) || !canonical.is_file() {
@@ -206,7 +216,13 @@ fn find_dawstream_exe(elevated: bool) -> Option<PathBuf> {
     let pf_base = known_folder(&FOLDERID_ProgramFiles)?;
     let pf_exe = pf_base.join("DAWStream").join("DAWStream.exe");
     if let Some(valid) = pf_exe.to_str().and_then(validate_companion_exe) {
-        return Some(valid);
+        // A link inside Program Files must still resolve to somewhere inside Program Files
+        let inside_pf = std::fs::canonicalize(&pf_base)
+            .map(|pf| valid.starts_with(pf))
+            .unwrap_or(false);
+        if inside_pf {
+            return Some(valid);
+        }
     }
 
     // Security guard: if the DAW is running elevated (Administrator),
@@ -249,8 +265,12 @@ fn find_dawstream_exe(elevated: bool) -> Option<PathBuf> {
 fn launch_companion_app() -> Result<(), String> {
     let elevated = is_process_elevated();
     if let Some(exe) = find_dawstream_exe(elevated) {
-        Command::new(&exe)
-            .spawn()
+        let mut cmd = Command::new(&exe);
+        // Don't inherit the DAW's (possibly untrusted) working directory
+        if let Some(dir) = exe.parent() {
+            cmd.current_dir(dir);
+        }
+        cmd.spawn()
             .map_err(|e| format!("Launch error: {e}"))?;
         return Ok(());
     }
@@ -311,11 +331,8 @@ impl Plugin for DawStreamPlugin {
     }
 
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        // Prevent glutin WGL backend from loading an attacker-supplied DLL via GLUTIN_WGL_OPENGL_DLL
-        unsafe {
-            std::env::remove_var("GLUTIN_WGL_OPENGL_DLL");
-        }
-
+        // NOTE: never mutate the process environment here — this DLL runs inside a
+        // multi-threaded host. (The plugin editor uses baseview's own WGL, not glutin.)
         let params = self.params.clone();
         let ring = self
             .ring
@@ -327,12 +344,15 @@ impl Plugin for DawStreamPlugin {
         }
 
         let initial_hb = ring.as_ref().map(|r| r.app_heartbeat()).unwrap_or(0);
+        let initial_plugin_hb = ring.as_ref().map(|r| r.heartbeat()).unwrap_or(0);
         let ui_state = EditorUiState {
             ring,
             instance_id: self.instance_id.clone(),
             last_app_hb: initial_hb,
             last_app_hb_time: None,
             app_connected: false,
+            last_plugin_hb: initial_plugin_hb,
+            last_plugin_hb_time: Instant::now(),
             smooth_l: 0.0,
             smooth_r: 0.0,
             launch_error: None,
@@ -362,9 +382,23 @@ impl Plugin for DawStreamPlugin {
                     {
                         state.app_connected = false;
                     }
+                    // Peaks are only refreshed by process(); if the host stopped calling it
+                    // (bypass, disabled track, stopped device) treat them as silence.
+                    let plugin_hb = ring.heartbeat();
+                    if plugin_hb != state.last_plugin_hb {
+                        state.last_plugin_hb = plugin_hb;
+                        state.last_plugin_hb_time = Instant::now();
+                    }
+                    let processing =
+                        state.last_plugin_hb_time.elapsed() < Duration::from_millis(150);
+
                     let owner = ring.active_owner_id();
                     let is_owner = owner == 0 || (my_id != 0 && owner == my_id);
-                    let (l, r) = if is_owner { ring.peaks() } else { (0.0, 0.0) };
+                    let (l, r) = if is_owner && processing {
+                        ring.peaks()
+                    } else {
+                        (0.0, 0.0)
+                    };
                     (l, r, ring.sample_rate(), is_owner)
                 } else {
                     (0.0, 0.0, 48_000, true)
@@ -525,10 +559,11 @@ impl Plugin for DawStreamPlugin {
         if self.ring.is_none() {
             self.ring = SharedAudioRing::open_or_create().ok().map(Arc::new);
         }
+        self.sample_rate = buffer_config.sample_rate.round() as u32;
         if let Some(ring) = &self.ring {
             let id = ensure_instance_id(ring, &self.instance_id);
             if ring.is_or_claim_owner(id) {
-                ring.set_sample_rate(buffer_config.sample_rate.round() as u32);
+                ring.set_sample_rate(self.sample_rate);
             }
         }
         true
@@ -548,6 +583,10 @@ impl Plugin for DawStreamPlugin {
         let id = self.instance_id.load(Ordering::Acquire);
         if !ring.is_or_claim_owner(id) {
             return ProcessStatus::Normal;
+        }
+        // Always publish OUR rate: ownership may have moved here via Take Over / lease expiry
+        if ring.sample_rate() != self.sample_rate {
+            ring.set_sample_rate(self.sample_rate);
         }
 
         let num_samples = buffer.samples();
