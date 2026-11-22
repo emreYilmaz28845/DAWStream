@@ -53,6 +53,10 @@ You keep listening through your audio interface exactly like before. The app pla
 1. Add **DAWStream** as the **last effect on your Master channel**. Anything after it won't be heard on the stream.
 2. Open the plugin window and click **Open App** (or open DAWStream from the desktop shortcut).
 
+When it's connected to the app, the plugin shows a green **LIVE**:
+
+<img src="docs/images/plugin.jpg" alt="DAWStream plugin window in FL Studio showing LIVE" width="420">
+
 Tip: put it in your default project template so you never have to think about it again. When the app isn't running, the plugin does basically nothing.
 
 **In the DAWStream app**
@@ -60,6 +64,12 @@ Tip: put it in your default project template so you never have to think about it
 1. **Window:** pick your DAW. It's usually selected for you (marked `[DAW]`). Hit *Refresh* if you opened the DAW after the app.
 2. **Audio Output:** pick a device you're *not* listening on. Devices that are probably safe are marked `[Recommended]`. If you pick your main audio interface you'll get a `[!] Double audio risk` warning — you'll hear yourself twice.
 3. The dot in the top-left should turn green and say **LIVE**. Play something and the meter should move.
+
+![DAWStream app mirroring FL Studio, with the toolbar on top](docs/images/app.jpg)
+
+<img src="docs/images/audio-output.jpg" alt="Audio Output list: a Realtek digital output marked Recommended, audio interface outputs marked with [!]" width="560">
+
+In the list above, `Realtek Digital Output` is the safe pick. The `[!]` entries are the audio interface you monitor on, so picking one of them means hearing everything twice.
 
 **In Discord**
 
@@ -148,6 +158,7 @@ Output:
 | `crates/dawstream-ipc` | Shared-memory ring buffer the plugin and app use to talk to each other |
 | `xtask` | Build helper for bundling the plugin |
 | `assets` | Logo, wordmark and the app icon (`icon.ico` is embedded into the exe at build time) |
+| `docs/images` | Screenshots used in this README |
 
 ## License
 
