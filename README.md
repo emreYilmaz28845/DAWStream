@@ -1,6 +1,11 @@
-# DAWStream
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/wordmark-dark.svg">
+    <img src="assets/wordmark-light.svg" alt="DAWStream" width="480">
+  </picture>
+</h1>
 
-Share your DAW on Discord **with sound**.
+<p align="center">Share your DAW on Discord <b>with sound</b>.</p>
 
 If you've ever tried to screen-share FL Studio, Ableton, Cubase etc. on Discord, you know the problem: your friends see the screen but hear nothing. That's because your DAW plays audio through ASIO, and Discord can't pick up ASIO audio.
 
@@ -143,6 +148,7 @@ Output:
 | `crates/dawstream-app` | The companion app (window mirror + WASAPI playback), built with egui |
 | `crates/dawstream-ipc` | Shared-memory ring buffer the plugin and app use to talk to each other |
 | `xtask` | Build helper for bundling the plugin |
+| `assets` | Logo, wordmark and the app icon (`icon.ico` is embedded into the exe at build time) |
 
 ## License
 

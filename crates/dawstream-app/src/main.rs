@@ -115,8 +115,13 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     };
 
+    let mut viewport = egui::ViewportBuilder::default();
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../../../assets/icon-256.png")) {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
+        viewport: viewport
             .with_title(APP_WINDOW_TITLE)
             .with_inner_size([1280.0, 760.0])
             .with_min_inner_size([640.0, 400.0]),

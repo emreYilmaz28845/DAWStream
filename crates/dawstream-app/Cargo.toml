@@ -29,3 +29,6 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Dwm",
     "Win32_Storage_Xps",
 ] }
+
+[build-dependencies]
+winresource = "0.1"
